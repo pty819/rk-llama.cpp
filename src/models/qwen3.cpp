@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "models.h"
 
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
@@ -148,6 +149,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    // Pooled embeddings never read the logits: skip the [n_embd x n_vocab] lm_head
+    // (151936 x 1024 for Qwen3-0.6B, ~85 GMAC for a 547-token batch).
+    // Set LLAMA_EMBD_KEEP_LM_HEAD=1 to restore the old behaviour.
+    if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE && getenv("LLAMA_EMBD_KEEP_LM_HEAD") == nullptr) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // lm_head
     cur = build_lora_mm(model.output, cur, model.output_s);
