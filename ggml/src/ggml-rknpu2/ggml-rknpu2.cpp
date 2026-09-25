@@ -27,6 +27,7 @@
 #include <limits>
 #include <sys/mman.h>
 #include <sstream>
+#include <array>
 #include <thread>
 #include <climits>
 #include <linux/futex.h>
@@ -63,7 +64,9 @@ static Stats g;
 static int forward_idx = 0;
 static double last_graph_end = 0;
 static inline double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static void (*extra_dump)() = nullptr;   // npufa: NPU flash-attention stats
 static void dump(const char * why) {
+    if (enabled() && extra_dump) extra_dump();
     if (!enabled() || g.n_matmul == 0) { g = Stats(); return; }
     fprintf(stderr, "\n[RKNPU_PROFILE] ===== %s #%d: graph_compute calls=%ld matmuls=%ld run calls=%ld ctx_create=%ld B_bind=%ld A_alloc=%ld C_alloc=%ld A_reuse=%ld m_tile=%d\n",
         why, forward_idx, g.n_graph, g.n_matmul, g.n_run, g.n_ctx_create, g.n_b_bind, g.n_a_alloc, g.n_c_alloc, g.n_a_reuse, (int)(getenv("RKNPU_M_TILE") ? atoi(getenv("RKNPU_M_TILE")) : 256));
@@ -1080,6 +1083,380 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
     return GGML_STATUS_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// npufa (2026-09-26): FLASH_ATTN_EXT on the NPU (RKNPU_FA=1; default off = previous behaviour).
+// Non-fused: per (query tile of RKNPU_FA_MT rows, KV head): S = Q.K^T on the NPU (fp16 x fp16 -> fp32; the GQA Q heads
+// sharing the KV head are stacked in M; B = K rows as TP_NORM), exact mask + scale + softmax on the CPU (fp32, P written as
+// unnormalized fp16 straight into the PV A buffer), O = P.V on the NPU (B = V rows, normal layout), O *= 1/rowsum.
+// A/C use the NPU native layouts (normal layouts make rknn_matmul_run convert on the CPU). The key range per tile is
+// taken from the actual ggml mask tensor (per-row first/last unmasked key; rows whose in-range mask is not all-zero take an
+// exact generic path), rounded up to a multiple of the query tile (256) and the partial last tile is zero-padded to a full
+// tile, so the context set for any length is a subset of the set for the longest length (bounded by RKNPU_FA_MAX_KV, not by
+// the variety of lengths). RKNPU_FA_THREADS driver threads (default 6 = 2 per NPU core) each own their contexts.
+// Memory bounds: RKNPU_FA_MAX_CTX (default 192) = LRU context eviction (per driver thread); RKNPU_FA_MAX_KV (default 4096)
+// = key length above which supports_op declines (CPU FA fallback).
+// ---------------------------------------------------------------------------------------------------------------
+static bool rknpu_fa_enabled() {
+    static const bool v = [](){ const char* e = std::getenv("RKNPU_FA"); return e && std::atoi(e) != 0; }();
+    return v;
+}
+static int rknpu_fa_env(const char * name, int def) { const char* e = std::getenv(name); int v = e ? std::atoi(e) : def; return v > 0 ? v : def; }
+
+namespace rkfa {
+static inline int rup(int x, int a) { return (x + a - 1) / a * a; }
+struct Ctx { rknn_matmul_ctx ctx = 0; rknn_matmul_info info; rknn_matmul_io_attr io; rknn_tensor_mem *bA = nullptr, *bB = nullptr, *bC = nullptr; uint64_t last = 0; };
+struct Mem { rknn_tensor_mem * m = nullptr; size_t size = 0; rknn_matmul_ctx owner = 0; };
+struct TB { Mem q, s, p, o; std::vector<float> inv; std::vector<float32x4_t> mx4, sm4; };
+static std::mutex mu;
+static std::map<std::tuple<int,int,int,int,int>, Ctx*> ctxs;   // (M, K, N, B layout, slot)
+static Ctx * anyctx = nullptr;
+static double create_ms = 0; static long n_create = 0, n_evict = 0;
+static uint64_t tick = 0;          // LRU clock (under mu)
+static size_t g_max_ctx = 192;
+static std::vector<Mem> kbuf, vbuf;
+static std::vector<TB> tbs;
+static std::vector<int> row_lo, row_hi; static std::vector<uint8_t> row_clean;
+
+// Contexts of a slot are only used by that slot's driver thread, so a thread may evict its own LRU contexts inside a
+// call (except `keep`, the context it currently holds, and anyctx which owns the buffers). Hard cap = max(RKNPU_FA_MAX_CTX,
+// what is needed for one job per thread).
+static Ctx * get_ctx(int M, int K, int N, int layout, int slot, Ctx * keep = nullptr) {
+    std::lock_guard<std::mutex> lk(mu);
+    auto key = std::make_tuple(M, K, N, layout, slot);
+    auto it = ctxs.find(key);
+    if (it != ctxs.end()) { it->second->last = ++tick; return it->second; }
+    while (ctxs.size() >= g_max_ctx) {
+        auto victim = ctxs.end();
+        for (auto jt = ctxs.begin(); jt != ctxs.end(); ++jt) {
+            if (std::get<4>(jt->first) != slot || jt->second == anyctx || jt->second == keep) continue;
+            if (victim == ctxs.end() || jt->second->last < victim->second->last) victim = jt;
+        }
+        if (victim == ctxs.end()) break;
+        rknn_matmul_destroy(victim->second->ctx); delete victim->second; ctxs.erase(victim); n_evict++;
+    }
+    double t0 = rknpu_prof::now_ms();
+    Ctx * c = new Ctx();
+    c->last = ++tick;
+    memset(&c->info, 0, sizeof(c->info)); memset(&c->io, 0, sizeof(c->io));
+    c->info.M = M; c->info.K = K; c->info.N = N; c->info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+    c->info.B_layout = layout; c->info.AC_layout = 1;
+    int ret = rknn_matmul_create(&c->ctx, &c->info, &c->io);
+    if (ret < 0) { fprintf(stderr, "RKNPU FA: rknn_matmul_create failed %d (M=%d K=%d N=%d layout=%d)\n", ret, M, K, N, layout); delete c; return nullptr; }
+    if (c->io.A.dims[c->io.A.n_dims - 1] != 8 || c->io.C.dims[c->io.C.n_dims - 1] != 4) {
+        fprintf(stderr, "RKNPU FA: unexpected native layout (A group %u, C group %u)\n", c->io.A.dims[c->io.A.n_dims - 1], c->io.C.dims[c->io.C.n_dims - 1]);
+        rknn_matmul_destroy(c->ctx); delete c; return nullptr;
+    }
+    const int core = slot % 3;
+    rknn_matmul_set_core_mask(c->ctx, core == 0 ? RKNN_NPU_CORE_0 : core == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
+    if (!anyctx) anyctx = c;
+    create_ms += rknpu_prof::now_ms() - t0; n_create++;
+    ctxs[key] = c;
+    return c;
+}
+static void clear_binds() { for (auto & kv : ctxs) { kv.second->bA = kv.second->bB = kv.second->bC = nullptr; } }
+static bool ensure(Mem & mm, size_t size) {   // call only while no driver thread runs
+    if (mm.m && mm.size >= size) return true;
+    if (mm.m) rknn_destroy_mem(mm.owner, mm.m);
+    mm.m = rknn_create_mem(anyctx->ctx, size); mm.owner = anyctx->ctx; mm.size = size;
+    if (!mm.m) { mm.size = 0; return false; }
+    memset(mm.m->virt_addr, 0, size);   // V padding rows must be finite (P=0 there)
+    clear_binds();
+    return true;
+}
+static inline bool bind(Ctx * c, rknn_tensor_mem * a, rknn_tensor_mem * b, rknn_tensor_mem * cc) {
+    if (c->bA != a) { if (rknn_matmul_set_io_mem(c->ctx, a, &c->io.A) < 0) return false; c->bA = a; }
+    // B is always re-bound: for non-native B layouts the runtime converts/caches B at set_io_mem time, so new K/V data
+    // behind the same buffer is not picked up otherwise (stale K/V from the previous layer).
+    if (rknn_matmul_set_io_mem(c->ctx, b, &c->io.B) < 0) return false; c->bB = b;
+    if (c->bC != cc) { if (rknn_matmul_set_io_mem(c->ctx, cc, &c->io.C) < 0) return false; c->bC = cc; }
+    return true;
+}
+inline static float32x4_t v_expf(float32x4_t x) {   // same as ggml_v_expf
+    const float32x4_t r = vdupq_n_f32(0x1.8p23f);
+    const float32x4_t z = vfmaq_f32(r, x, vdupq_n_f32(0x1.715476p+0f));
+    const float32x4_t n = vsubq_f32(z, r);
+    const float32x4_t b = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(0x1.62e4p-1f)), n, vdupq_n_f32(0x1.7f7d1cp-20f));
+    const uint32x4_t e = vshlq_n_u32(vreinterpretq_u32_f32(z), 23);
+    const float32x4_t k = vreinterpretq_f32_u32(vaddq_u32(e, vreinterpretq_u32_f32(vdupq_n_f32(1))));
+    const uint32x4_t c = vcagtq_f32(n, vdupq_n_f32(126));
+    const float32x4_t u = vmulq_f32(b, b);
+    const float32x4_t j = vfmaq_f32(vmulq_f32(vdupq_n_f32(0x1.ffffecp-1f), b),
+        vfmaq_f32(vfmaq_f32(vdupq_n_f32(0x1.fffdb6p-2f), vdupq_n_f32(0x1.555e66p-3f), b),
+                  vfmaq_f32(vdupq_n_f32(0x1.573e2ep-5f), vdupq_n_f32(0x1.0e4020p-7f), b), u), u);
+    if (!vpaddd_u64(vreinterpretq_u64_u32(c))) return vfmaq_f32(k, j, k);
+    const uint32x4_t d = vandq_u32(vclezq_f32(n), vdupq_n_u32(0x82000000));
+    const float32x4_t s1 = vreinterpretq_f32_u32(vaddq_u32(d, vdupq_n_u32(0x7f000000)));
+    const float32x4_t s2 = vreinterpretq_f32_u32(vsubq_u32(e, d));
+    return vbslq_f32(vcagtq_f32(n, vdupq_n_f32(192)), vmulq_f32(s1, s1),
+                     vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)));
+}
+enum { F_MASK, F_GATHER, F_QFILL, F_BIND, F_RUNQK, F_SOFTMAX, F_RUNPV, F_OUT, F_N };
+static double ft[F_N]; static long f_n = 0; static double f_wall = 0;
+static const char * fname[F_N] = {"mask scan (wall)", "K/V gather+sync (wall)", "Q fill+sync (thr)", "bind (thr)", "run QK (thr)",
+                                  "softmax+syncs (thr)", "run PV (thr)", "O sync+scale (thr)"};
+static void dump_prof() {
+    if (f_n == 0) return;
+    fprintf(stderr, "[RKNPU_PROFILE] NPU FA: nodes=%ld wall=%.2f ms (%.3f ms/node) contexts live=%zu created=%ld evicted=%ld (create %.1f ms total)\n", f_n, f_wall, f_wall / f_n, ctxs.size(), n_create, n_evict, create_ms);
+    for (int i = 0; i < F_N; i++) fprintf(stderr, "[RKNPU_PROFILE]   FA %-26s %9.2f ms\n", fname[i], ft[i]);
+    memset(ft, 0, sizeof(ft)); f_n = 0; f_wall = 0;
+}
+} // namespace rkfa
+
+static bool rknpu_fa_supported(const ggml_tensor * op) {
+    if (!rknpu_fa_enabled()) return false;
+    const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * mask = op->src[3];
+    if (!q || !k || !v) return false;
+    if (op->src[4] != nullptr) return false;                         // attention sinks
+    float max_bias = 0.f, softcap = 0.f;
+    memcpy(&max_bias, (const float *)op->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *)op->op_params + 2, sizeof(float));
+    if (max_bias != 0.f || softcap != 0.f) return false;            // ALiBi / logit softcap
+    if (op->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) return false;
+    if (mask && mask->type != GGML_TYPE_F16) return false;
+    const int64_t D = q->ne[0];
+    if (D % 32 != 0 || D > 256 || k->ne[0] != D || v->ne[0] != D) return false;
+    if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) return false;
+    if (k->ne[2] <= 0 || q->ne[2] % k->ne[2] != 0 || v->ne[2] != k->ne[2] || v->ne[1] != k->ne[1]) return false;
+    if (q->ne[2] / k->ne[2] > 4) return false;
+    static const int max_kv = std::min(8192, rknpu_fa_env("RKNPU_FA_MAX_KV", 4096));
+    if (q->ne[1] < 16 || k->ne[1] > max_kv) return false;            // tiny batches stay on the CPU; key-length cap (memory / PV K limit)
+    if (q->nb[0] != 4 || k->nb[0] != 2 || v->nb[0] != 2 || op->nb[0] != 4) return false;
+    if (op->ne[0] != D || op->ne[1] != q->ne[2] || op->ne[2] != q->ne[1]) return false;
+    if (mask && (mask->nb[0] != 2 || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1])) return false;
+    return true;
+}
+
+static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
+    using namespace rkfa;
+    const bool prof = rknpu_prof::enabled();
+    if (prof) rknpu_prof::extra_dump = rkfa::dump_prof;
+    const double T0 = rknpu_prof::now_ms();
+    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
+    float scale; memcpy(&scale, (const float *)dst->op_params + 0, sizeof(float));
+    const int D = (int)q->ne[0], n = (int)q->ne[1], H = (int)q->ne[2], nkv = (int)k->ne[1], Hkv = (int)k->ne[2], ratio = H / Hkv;
+    static const int mt = rkfa::rup(rknpu_fa_env("RKNPU_FA_MT", 256), 32);
+    const int NB = mt;   // key-range buckets = multiples of the query tile
+    g_max_ctx = (size_t)rknpu_fa_env("RKNPU_FA_MAX_CTX", 192);
+    static const int nthr = std::min(32, rknpu_fa_env("RKNPU_FA_THREADS", 6));
+    const int kvcap = rup(nkv, NB);
+
+    // ---- 1. mask scan: per query row first/last unmasked key and whether the in-range mask is all zero ----
+    row_lo.resize(n); row_hi.resize(n); row_clean.resize(n);
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < n; t++) {
+        if (!mask) { row_lo[t] = 0; row_hi[t] = nkv - 1; row_clean[t] = 1; continue; }
+        const uint16_t * mr = (const uint16_t *)((const char *)mask->data + (size_t)t * mask->nb[1]);
+        int lo = 0; while (lo < nkv && mr[lo] == 0xFC00) lo++;
+        int hi = nkv - 1; while (hi >= lo && mr[hi] == 0xFC00) hi--;
+        bool clean = true;
+        int j = lo;
+        const uint16x8_t m7 = vdupq_n_u16(0x7FFF);
+        for (; j + 8 <= hi + 1; j += 8) { if (vmaxvq_u16(vandq_u16(vld1q_u16(mr + j), m7)) != 0) { clean = false; break; } }
+        if (clean) for (; j <= hi; j++) if ((mr[j] & 0x7FFF) != 0) { clean = false; break; }
+        if (lo > hi) { lo = 0; hi = -1; clean = true; }   // fully masked row -> output 0
+        row_lo[t] = lo; row_hi[t] = hi; row_clean[t] = clean;
+    }
+    const double T1 = rknpu_prof::now_ms();
+
+    // ---- 2. jobs: (tile, kv head); tile key range from the mask, bucketed ----
+    struct Job { int r0, mtc, mtp, g, Nq; };
+    std::vector<Job> jobs;
+    for (int r0 = 0; r0 < n; r0 += mt) {
+        const int mtc = std::min(mt, n - r0);
+        int kend = 0;
+        for (int i = 0; i < mtc; i++) kend = std::max(kend, row_hi[r0 + i] + 1);
+        if (kend <= 0) {   // fully masked tile: zeros
+            for (int i = 0; i < mtc; i++) for (int h = 0; h < H; h++)
+                memset((char *)dst->data + (size_t)(r0 + i) * dst->nb[2] + (size_t)h * dst->nb[1], 0, (size_t)D * sizeof(float));
+            continue;
+        }
+        const int Nq = std::min(rup(kend, NB), kvcap);
+        for (int g = 0; g < Hkv; g++) jobs.push_back({r0, mtc, mt, g, Nq});   // partial tile zero-padded to a full tile (fixed M)
+    }
+    std::stable_sort(jobs.begin(), jobs.end(), [](const Job & a, const Job & b){ return (long)a.Nq * a.mtp > (long)b.Nq * b.mtp; });
+    if (jobs.empty()) return GGML_STATUS_SUCCESS;
+
+    // ---- 3. buffers ----
+    if (!anyctx && !get_ctx(ratio * jobs[0].mtp, D, jobs[0].Nq, 2, 0)) return GGML_STATUS_FAILED;
+    if ((int)kbuf.size() < Hkv) { kbuf.resize(Hkv); vbuf.resize(Hkv); }
+    if ((int)tbs.size() < nthr) tbs.resize(nthr);
+    const size_t Mmax = (size_t)ratio * mt;
+    for (int g = 0; g < Hkv; g++) if (!ensure(kbuf[g], (size_t)kvcap * D * 2) || !ensure(vbuf[g], (size_t)kvcap * D * 2)) return GGML_STATUS_FAILED;
+    for (int t = 0; t < nthr; t++) {
+        TB & b = tbs[t];
+        if (!ensure(b.q, Mmax * D * 2) || !ensure(b.s, Mmax * kvcap * 4) || !ensure(b.p, Mmax * kvcap * 2) || !ensure(b.o, Mmax * D * 4)) return GGML_STATUS_FAILED;
+        b.inv.resize(Mmax); b.mx4.resize(Mmax); b.sm4.resize(Mmax);
+    }
+    // ---- 4. gather per-KV-head K/V rows from the (strided) F16 cache ----
+    #pragma omp parallel for schedule(static)
+    for (int x = 0; x < 2 * Hkv; x++) {
+        const int g = x >> 1; const ggml_tensor * src = (x & 1) ? v : k;
+        __fp16 * d = (__fp16 *)((x & 1) ? vbuf[g].m->virt_addr : kbuf[g].m->virt_addr);
+        for (int j = 0; j < nkv; j++) memcpy(d + (size_t)j * D, (const char *)src->data + (size_t)j * src->nb[1] + (size_t)g * src->nb[2], (size_t)D * 2);
+    }
+    for (int g = 0; g < Hkv; g++) {
+        if (rknn_mem_sync(anyctx->ctx, kbuf[g].m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0 || rknn_mem_sync(anyctx->ctx, vbuf[g].m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) return GGML_STATUS_FAILED;
+    }
+    const double T2 = rknpu_prof::now_ms();
+
+    // ---- 5. driver threads ----
+    std::atomic<int> next{0};
+    std::atomic<bool> failed{false};
+    std::vector<std::array<double, F_N>> tacc(nthr);
+    auto worker = [&](int tid) {
+        TB & b = tbs[tid];
+        std::array<double, F_N> & ta = tacc[tid]; ta.fill(0.0);
+        const float32x4_t ninf = vdupq_n_f32(-INFINITY), zero = vdupq_n_f32(0.f), vs = vdupq_n_f32(scale);
+        const int32x4_t lane = {0, 1, 2, 3};
+        for (;;) {
+            const int ji = next.fetch_add(1);
+            if (ji >= (int)jobs.size() || failed.load(std::memory_order_relaxed)) break;
+            const Job & jb = jobs[ji];
+            const int M = ratio * jb.mtp, Nq = jb.Nq;
+            Ctx * cq = get_ctx(M, D, Nq, 2, tid);
+            Ctx * cv = get_ctx(M, Nq, D, 0, tid, cq);
+            if (!cq || !cv) { failed = true; break; }
+            double t0 = prof ? rknpu_prof::now_ms() : 0;
+            // Q -> native A (D/8, M, 8) fp16; padded rows zero
+            __fp16 * qa = (__fp16 *)b.q.m->virt_addr;
+            for (int hh = 0; hh < ratio; hh++) for (int i = 0; i < jb.mtp; i++) {
+                const int r = hh * jb.mtp + i;
+                if (i >= jb.mtc) { for (int d = 0; d < D; d += 8) vst1q_f16(qa + ((size_t)(d / 8) * M + r) * 8, vdupq_n_f16(0)); continue; }
+                const float * src = (const float *)((const char *)q->data + (size_t)(jb.r0 + i) * q->nb[1] + (size_t)(jb.g * ratio + hh) * q->nb[2]);
+                for (int d = 0; d < D; d += 8)
+                    vst1q_f16(qa + ((size_t)(d / 8) * M + r) * 8, vcombine_f16(vcvt_f16_f32(vld1q_f32(src + d)), vcvt_f16_f32(vld1q_f32(src + d + 4))));
+            }
+            if (rknn_mem_sync(cq->ctx, b.q.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
+            double t1 = prof ? rknpu_prof::now_ms() : 0;
+            if (!bind(cq, b.q.m, kbuf[jb.g].m, b.s.m) || !bind(cv, b.p.m, vbuf[jb.g].m, b.o.m)) { failed = true; break; }
+            double t2 = prof ? rknpu_prof::now_ms() : 0;
+            if (rknn_matmul_run(cq->ctx) < 0) { failed = true; break; }
+            double t3 = prof ? rknpu_prof::now_ms() : 0;
+            if (rknn_mem_sync(cq->ctx, b.s.m, RKNN_MEMORY_SYNC_FROM_DEVICE) < 0) { failed = true; break; }
+            // ---- softmax over native S (Nq/4, M, 4) -> native P (Nq/8, M, 8) ----
+            const float * S = (const float *)b.s.m->virt_addr; __fp16 * P = (__fp16 *)b.p.m->virt_addr;
+            auto row_tok = [&](int r, int & t) -> bool { const int i = r % jb.mtp; t = jb.r0 + i; return i < jb.mtc; };
+            for (int r = 0; r < M; r++) b.mx4[r] = ninf;
+            for (int n4 = 0; n4 < Nq / 4; n4++) {
+                const int j0 = n4 * 4;
+                const float * Sb = S + (size_t)n4 * M * 4;
+                for (int r = 0; r < M; r++) {
+                    int t; if (!row_tok(r, t) || !row_clean[t]) continue;
+                    const int lo = row_lo[t], hi = row_hi[t];
+                    if (j0 > hi || j0 + 3 < lo) continue;
+                    float32x4_t x = vld1q_f32(Sb + (size_t)r * 4);
+                    if (j0 < lo || j0 + 3 > hi) {
+                        const int32x4_t jj = vaddq_s32(lane, vdupq_n_s32(j0));
+                        x = vbslq_f32(vandq_u32(vcgeq_s32(jj, vdupq_n_s32(lo)), vcleq_s32(jj, vdupq_n_s32(hi))), x, ninf);
+                    }
+                    b.mx4[r] = vmaxq_f32(b.mx4[r], x);
+                }
+            }
+            for (int r = 0; r < M; r++) { const float m = vmaxvq_f32(b.mx4[r]); b.mx4[r] = vdupq_n_f32(std::isinf(m) ? 0.f : -m * scale); b.sm4[r] = zero; }
+            for (int n8 = 0; n8 < Nq / 8; n8++) {
+                const int j0 = n8 * 8;
+                const float * Sb0 = S + (size_t)(2 * n8) * M * 4, * Sb1 = S + (size_t)(2 * n8 + 1) * M * 4;
+                __fp16 * Pb = P + (size_t)n8 * M * 8;
+                for (int r = 0; r < M; r++) {
+                    int t; const bool valid = row_tok(r, t);
+                    if (!valid || !row_clean[t] || j0 > row_hi[t] || j0 + 7 < row_lo[t]) { vst1q_f16(Pb + (size_t)r * 8, vdupq_n_f16(0)); continue; }
+                    const int lo = row_lo[t], hi = row_hi[t];
+                    float32x4_t e0 = v_expf(vfmaq_f32(b.mx4[r], vld1q_f32(Sb0 + (size_t)r * 4), vs));
+                    float32x4_t e1 = v_expf(vfmaq_f32(b.mx4[r], vld1q_f32(Sb1 + (size_t)r * 4), vs));
+                    if (j0 < lo || j0 + 7 > hi) {
+                        const int32x4_t j0v = vaddq_s32(lane, vdupq_n_s32(j0)), j1v = vaddq_s32(lane, vdupq_n_s32(j0 + 4));
+                        const int32x4_t lov = vdupq_n_s32(lo), hiv = vdupq_n_s32(hi);
+                        e0 = vbslq_f32(vandq_u32(vcgeq_s32(j0v, lov), vcleq_s32(j0v, hiv)), e0, zero);
+                        e1 = vbslq_f32(vandq_u32(vcgeq_s32(j1v, lov), vcleq_s32(j1v, hiv)), e1, zero);
+                    }
+                    b.sm4[r] = vaddq_f32(b.sm4[r], vaddq_f32(e0, e1));
+                    vst1q_f16(Pb + (size_t)r * 8, vcombine_f16(vcvt_f16_f32(e0), vcvt_f16_f32(e1)));
+                }
+            }
+            for (int r = 0; r < M; r++) { const float s = vaddvq_f32(b.sm4[r]); b.inv[r] = s > 0.f ? 1.0f / s : 0.f; }
+            // exact generic path for rows with non-trivial mask values inside their range
+            for (int r = 0; r < M; r++) {
+                int t; if (!row_tok(r, t) || row_clean[t]) continue;
+                const uint16_t * mr = (const uint16_t *)((const char *)mask->data + (size_t)t * mask->nb[1]);
+                const __fp16 * mh = (const __fp16 *)mr;
+                auto logit = [&](int j) -> float {
+                    if (j >= nkv || mr[j] == 0xFC00) return -INFINITY;
+                    return S[((size_t)(j / 4) * M + r) * 4 + (j & 3)] * scale + (float)mh[j];
+                };
+                float mx = -INFINITY;
+                for (int j = 0; j < Nq; j++) mx = std::max(mx, logit(j));
+                double sum = 0;
+                for (int j = 0; j < Nq; j++) {
+                    const float l = logit(j);
+                    const float e = std::isinf(mx) || std::isinf(l) ? 0.f : expf(l - mx);
+                    sum += e; P[((size_t)(j / 8) * M + r) * 8 + (j & 7)] = (__fp16)e;
+                }
+                b.inv[r] = sum > 0 ? (float)(1.0 / sum) : 0.f;
+            }
+            if (rknn_mem_sync(cv->ctx, b.p.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
+            double t4 = prof ? rknpu_prof::now_ms() : 0;
+            if (rknn_matmul_run(cv->ctx) < 0) { failed = true; break; }
+            double t5 = prof ? rknpu_prof::now_ms() : 0;
+            if (rknn_mem_sync(cv->ctx, b.o.m, RKNN_MEMORY_SYNC_FROM_DEVICE) < 0) { failed = true; break; }
+            // native O (D/4, M, 4) -> dst[token][head][d] * 1/rowsum
+            const float * O = (const float *)b.o.m->virt_addr;
+            for (int d4 = 0; d4 < D / 4; d4++) for (int r = 0; r < M; r++) {
+                int t; if (!row_tok(r, t)) continue;
+                const int h = jb.g * ratio + r / jb.mtp;
+                float * o = (float *)((char *)dst->data + (size_t)t * dst->nb[2] + (size_t)h * dst->nb[1]) + d4 * 4;
+                vst1q_f32(o, vmulq_f32(vld1q_f32(O + ((size_t)d4 * M + r) * 4), vdupq_n_f32(b.inv[r])));
+            }
+            if (prof) {
+                double t6 = rknpu_prof::now_ms();
+                ta[F_QFILL] += t1 - t0; ta[F_BIND] += t2 - t1; ta[F_RUNQK] += t3 - t2; ta[F_SOFTMAX] += t4 - t3; ta[F_RUNPV] += t5 - t4; ta[F_OUT] += t6 - t5;
+            }
+        }
+    };
+    {
+        std::vector<std::thread> th;
+        th.reserve(nthr);
+        for (int t = 0; t < nthr; t++) th.emplace_back(worker, t);
+        for (auto & t : th) t.join();
+    }
+    if (failed) { fprintf(stderr, "RKNPU FA: NPU attention failed\n"); return GGML_STATUS_FAILED; }
+    static const int fa_check = rknpu_fa_env("RKNPU_FA_CHECK", 0);
+    if (fa_check) {   // debug: fp32 reference for sampled rows
+        double dot = 0, na = 0, nb = 0, maxe = 0; int worst_t = -1, worst_h = -1;
+        std::vector<float> lg(nkv), ref(D);
+        for (int t = 0; t < n; t += fa_check) for (int h = 0; h < H; h++) {
+            const int g = h / ratio;
+            const float * qr = (const float *)((const char *)q->data + (size_t)t * q->nb[1] + (size_t)h * q->nb[2]);
+            float mx = -INFINITY;
+            for (int j = 0; j < nkv; j++) {
+                const __fp16 * kr = (const __fp16 *)((const char *)k->data + (size_t)j * k->nb[1] + (size_t)g * k->nb[2]);
+                float d = 0; for (int x = 0; x < D; x++) d += qr[x] * (float)kr[x];
+                const float mv = mask ? (float)((const __fp16 *)((const char *)mask->data + (size_t)t * mask->nb[1]))[j] : 0.f;
+                lg[j] = d * scale + mv; mx = std::max(mx, lg[j]);
+            }
+            double sum = 0; std::fill(ref.begin(), ref.end(), 0.f);
+            for (int j = 0; j < nkv; j++) {
+                const float e = std::isinf(lg[j]) ? 0.f : expf(lg[j] - mx); sum += e;
+                if (e == 0.f) continue;
+                const __fp16 * vr = (const __fp16 *)((const char *)v->data + (size_t)j * v->nb[1] + (size_t)g * v->nb[2]);
+                for (int x = 0; x < D; x++) ref[x] += e * (float)vr[x];
+            }
+            const float * o = (const float *)((const char *)dst->data + (size_t)t * dst->nb[2] + (size_t)h * dst->nb[1]);
+            double e1 = 0;
+            for (int x = 0; x < D; x++) { const float r = sum > 0 ? ref[x] / sum : 0.f; dot += r * o[x]; na += r * r; nb += o[x] * o[x]; e1 = std::max(e1, (double)fabsf(r - o[x])); }
+            if (e1 > maxe) { maxe = e1; worst_t = t; worst_h = h; }
+        }
+        fprintf(stderr, "RKNPU FA CHECK: n=%d nkv=%d H=%d Hkv=%d scale=%g cos=%.6f maxerr=%.4g (t=%d h=%d lo=%d hi=%d clean=%d) mask=%s ne=[%d,%d] nb1=%zu\n", n, nkv, H, Hkv, scale,
+                dot / sqrt(na * nb + 1e-30), maxe, worst_t, worst_h, worst_t >= 0 ? row_lo[worst_t] : -1, worst_t >= 0 ? row_hi[worst_t] : -1, worst_t >= 0 ? row_clean[worst_t] : -1,
+                mask ? "yes" : "no", mask ? (int)mask->ne[0] : 0, mask ? (int)mask->ne[1] : 0, mask ? mask->nb[1] : 0);
+    }
+    if (prof) {
+        ft[F_MASK] += T1 - T0; ft[F_GATHER] += T2 - T1;
+        for (auto & a : tacc) for (int i = F_QFILL; i < F_N; i++) ft[i] += a[i];
+        f_n++; f_wall += rknpu_prof::now_ms() - T0;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
@@ -1108,10 +1485,17 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     // the same src1 tensor (q/k/v, gate/up) is quantized once per (tile, K segment).
     backend_ctx->graph_epoch++;
 
-    if (rknpu_overlap()) return rknpu_graph_compute_overlap(backend_ctx, cgraph, config);
+    bool has_fa = false;
+    for (int node_i = 0; node_i < cgraph->n_nodes && !has_fa; node_i++) has_fa = cgraph->nodes[node_i]->op == GGML_OP_FLASH_ATTN_EXT;
+    if (rknpu_overlap() && !has_fa) return rknpu_graph_compute_overlap(backend_ctx, cgraph, config);
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            const enum ggml_status st = rknpu_fa_compute(node);
+            if (st != GGML_STATUS_SUCCESS) return st;
+            continue;
+        }
         if (node->op != GGML_OP_MUL_MAT) continue;
         RKPROF(ST_MATMUL);
         RKPROF_BEGIN(t_setup);
@@ -1965,6 +2349,9 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
+
+        case GGML_OP_FLASH_ATTN_EXT:
+            return rknpu_fa_supported(op);
 
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0]; // Weights
