@@ -27,6 +27,13 @@
 #include <limits>
 #include <sys/mman.h>
 #include <sstream>
+#include <thread>
+#include <climits>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
 
 #define UNUSED(x) (void)(x)
 
@@ -49,6 +56,7 @@ struct Stats {
     double macs_real = 0, macs_op = 0;
     double bytes_in = 0, bytes_out = 0;                // M*K*N vs M_op*K*N
     std::map<std::tuple<int,int,int>, std::pair<long,double>> run_by_shape; // (M_op,K,N) -> count, run ms
+    double ov_busy = 0, ov_start_lat = 0, ov_notice_lat = 0; long ov_jobs = 0, ov_stall_a = 0, ov_stall_dep = 0; // opt3 overlap: NPU submit->done, pipeline stalls
 };
 static bool enabled() { static int e = [](){ const char* v = getenv("RKNPU_PROFILE"); return v && atoi(v) > 0; }(); return e; }
 static Stats g;
@@ -66,6 +74,11 @@ static void dump(const char * why) {
             g.t[ST_MATMUL] > 0 ? 100.0*g.t[i]/g.t[ST_MATMUL] : 0.0);
     fprintf(stderr, "[RKNPU_PROFILE] per-core run: sum over cores=%.2f ms, sum of per-call max core=%.2f ms, wall run=%.2f ms (concurrency=%.2f)\n",
         g.run_core_sum, g.run_core_max_sum, g.t[ST_RUN], g.t[ST_RUN] > 0 ? g.run_core_sum / g.t[ST_RUN] : 0.0);
+    if (g.ov_jobs > 0)
+        fprintf(stderr, "[RKNPU_PROFILE] overlap: jobs=%ld NPU busy (submit->last core done)=%.2f ms, exposed wait (matmul_run row)=%.2f ms, hidden=%.2f ms, stalls: A-conflict=%ld dep=%ld\n",
+            g.ov_jobs, g.ov_busy, g.t[ST_RUN], g.ov_busy - g.t[ST_RUN], g.ov_stall_a, g.ov_stall_dep);
+    if (g.ov_jobs > 0)
+        fprintf(stderr, "[RKNPU_PROFILE] overlap latency: submit->last core start=%.2f ms, last core done->main sees it=%.2f ms (sum over jobs)\n", g.ov_start_lat, g.ov_notice_lat);
     for (auto & kv : g.run_by_shape) {
         double gmac = (double)std::get<0>(kv.first) * std::get<1>(kv.first) * std::get<2>(kv.first) / 1e9;
         double avg = kv.second.second / kv.second.first;
@@ -430,6 +443,7 @@ struct ggml_backend_rknpu_context {
         bool hadamard = false;
         const float * s_vec = nullptr;
         std::vector<float> scales;
+        std::shared_ptr<std::vector<float>> sp; // opt3 overlap path: per-quantization scale vector
     };
     std::unordered_map<const rknn_tensor_mem*, AState> a_state;
     uint64_t graph_epoch = 0;
@@ -598,6 +612,474 @@ static inline void rknpu_quant_row_i8(const float* x, int8_t* y, int n, float sc
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// opt3 (2026-09-25): overlap A quantization / C dequantization with the NPU matmul run (RKNPU_OVERLAP=1 enables; default OFF).
+// Every (matmul, M tile, K segment) of one graph_compute call becomes a job. Contexts, B binding, A/C buffers and the
+// A-reuse decisions are resolved serially up front (in job order, same decisions as the serial path). Execution is a
+// 3-stage software pipeline on the main thread + persistent NPU-submit threads (one per core segment):
+//     Q(0); for j: set_io(j); submit run(j) -> NPU threads;  D(j-1); Q(j+1);  wait run(j);   D(last)
+// Q = quantize (omp) + mem_sync A TO_DEVICE, D = mem_sync C FROM_DEVICE + dequant (omp). C buffers are double-buffered
+// (slot = job index & 1), each A buffer is per (tile, K offset); per-job A scale vectors are reference-counted so a later
+// re-quantization of the same A buffer never clobbers scales an earlier job still needs. Hazards handled:
+//   - Q(j+1) targets the same A buffer run(j) reads            -> wait run(j) first
+//   - src1 of job j+1 overlaps dst of job j (not yet dequant'd) -> wait run(j), D(j), then Q(j+1)
+// Q and D stay in job order, so K-segment accumulation order and all arithmetic are unchanged (bit-identical output).
+// Default (RKNPU_OVERLAP unset/0) is the original serial path. Interim result: ~100-150 ms/forward gain at 1023 tok, but
+// NPU runs slow down under concurrent CPU memory traffic; not yet enabled by default.
+// ---------------------------------------------------------------------------------------------------------------
+static bool rknpu_overlap() {
+    static const bool v = [](){ const char* e = std::getenv("RKNPU_OVERLAP"); return e ? std::atoi(e) != 0 : false; }();
+    return v;
+}
+
+// CPU threads used for quantize/dequant in the overlap path (0 = OpenMP default). Leaving one core of the
+// taskset free lets the NPU-submit threads wake up / return from the run ioctl without waiting for a CFS preemption.
+static int rknpu_ov_threads() {
+    static const int v = [](){ const char* e = std::getenv("RKNPU_OV_THREADS"); return e ? std::atoi(e) : 0; }();
+    return v > 0 ? v : omp_get_max_threads();
+}
+// Optional CPU list for the NPU-submit threads (e.g. "0-3" = little cores); unset = inherit process affinity.
+static void rknpu_ov_set_submit_affinity() {
+    const char* e = std::getenv("RKNPU_SUBMIT_CPUS");
+    if (!e || !*e) return;
+    auto cpus = parse_domain_list(e);
+    cpu_set_t set; CPU_ZERO(&set);
+    for (int c : cpus) if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+    if (CPU_COUNT(&set) > 0) pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
+static inline void rk_futex_wait(std::atomic<int>* a, int val) {
+    syscall(SYS_futex, reinterpret_cast<int*>(a), FUTEX_WAIT_PRIVATE, val, nullptr, nullptr, 0);
+}
+static inline void rk_futex_wake(std::atomic<int>* a) {
+    syscall(SYS_futex, reinterpret_cast<int*>(a), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+}
+static inline void rk_cpu_relax() { __asm__ __volatile__("yield" ::: "memory"); }
+static inline uint64_t rk_cntvct() { uint64_t v; __asm__ __volatile__("isb; mrs %0, cntvct_el0" : "=r"(v) :: "memory"); return v; }
+static inline uint64_t rk_cntfrq() { uint64_t v; __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
+// Spin budget (microseconds, sched_yield between polls) before a waiter sleeps on the futex.
+// NPU-submit threads: RKNPU_SPIN_US (default 2000; a job cycle is ~0.5-1.5 ms, so they rarely sleep inside a split);
+// main thread waiting for the NPU: RKNPU_WAIT_SPIN_US (default 5000).
+static uint64_t rk_spin_ticks(const char * env, int def_us) {
+    const char* e = std::getenv(env);
+    const int us = e ? std::atoi(e) : def_us;
+    return (uint64_t)((double)rk_cntfrq() * (us > 0 ? us : 0) / 1e6);
+}
+
+#define RK_MAX_SEG 8
+struct RkJob {
+    const ggml_tensor * node = nullptr;
+    const ggml_tensor * src1 = nullptr;
+    int M_op = 0, Mt = 0, K = 0, K_op = 0, N = 0, K_seg_op = 0, offset_k = 0, k_idx = 0;
+    bool first_k = true, hadamard = false, need_quant = false, deq_done = false;
+    int npu_type_a = 0, npu_type_c = 0;
+    const float * x = nullptr;
+    float * dst_tile = nullptr;
+    int row_stride = 0;
+    const float * s_vec = nullptr;
+    const float * scales_B_grid = nullptr;
+    int nseg = 0;
+    std::shared_ptr<rknpu_matmul_context> ctx[RK_MAX_SEG];
+    std::shared_ptr<rknn_tensor_mem> C[RK_MAX_SEG];
+    int n_off[RK_MAX_SEG] = {0}, n_size[RK_MAX_SEG] = {0};
+    std::shared_ptr<rknn_tensor_mem> A;
+    std::shared_ptr<std::vector<float>> scales;
+    double t_submit = 0;
+    double core_ms[RK_MAX_SEG] = {0};
+    double core_end[RK_MAX_SEG] = {0};
+    double core_start[RK_MAX_SEG] = {0};
+};
+
+// Persistent NPU-submit threads: thread i runs rknn_matmul_run for segment i of the submitted job (blocking ioctl).
+struct RkNpuPool {
+    int nthreads;
+    std::vector<std::thread> th;
+    std::atomic<int> gen{0};
+    std::atomic<int> pending{0};
+    std::atomic<RkJob*> jobp{nullptr};
+    uint64_t worker_spin = rk_spin_ticks("RKNPU_SPIN_US", 2000);
+    uint64_t wait_spin = rk_spin_ticks("RKNPU_WAIT_SPIN_US", 5000);
+    explicit RkNpuPool(int n) : nthreads(n) {
+        for (int i = 0; i < n; ++i) th.emplace_back([this, i]{ worker(i); });
+    }
+    void worker(int i) {
+        rknpu_ov_set_submit_affinity();
+        int last = 0;
+        for (;;) {
+            int g;
+            uint64_t t_spin0 = 0;
+            while ((g = gen.load(std::memory_order_acquire)) == last) {
+                const uint64_t now = rk_cntvct();
+                if (t_spin0 == 0) t_spin0 = now;
+                if (now - t_spin0 < worker_spin) { sched_yield(); continue; }
+                rk_futex_wait(&gen, last);
+                t_spin0 = 0;
+            }
+            last = g;
+            RkJob * jb = jobp.load(std::memory_order_acquire);
+            if (jb && i < jb->nseg) {
+                const bool prof = rknpu_prof::enabled();
+                double t0 = prof ? rknpu_prof::now_ms() : 0.0;
+                if (prof) jb->core_start[i] = t0;
+                int ret = rknn_matmul_run(jb->ctx[i]->ctx);
+                if (ret != RKNN_SUCC) fprintf(stderr, "RKNPU: rknn_matmul_run failed ret=%d\n", ret);
+                if (prof) { jb->core_end[i] = rknpu_prof::now_ms(); jb->core_ms[i] = jb->core_end[i] - t0; }
+            }
+            if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) rk_futex_wake(&pending);
+        }
+    }
+    void submit(RkJob * jb) {
+        pending.store(nthreads, std::memory_order_relaxed);
+        jobp.store(jb, std::memory_order_relaxed);
+        gen.fetch_add(1, std::memory_order_release);
+        rk_futex_wake(&gen);
+    }
+    void wait() {
+        int p;
+        uint64_t t_spin0 = 0;
+        while ((p = pending.load(std::memory_order_acquire)) != 0) {
+            const uint64_t now = rk_cntvct();
+            if (t_spin0 == 0) t_spin0 = now;
+            if (now - t_spin0 < wait_spin) { sched_yield(); continue; }
+            rk_futex_wait(&pending, p);
+            t_spin0 = 0;
+        }
+    }
+};
+static RkNpuPool * rknpu_get_pool(int nseg) {
+    // threads are intentionally leaked (idle in futex wait at process exit)
+    static RkNpuPool * pool = nullptr;
+    if (!pool || pool->nthreads < nseg) {
+        if (pool) { std::fprintf(stderr, "RKNPU: overlap pool grows to %d threads\n", nseg); }
+        pool = new RkNpuPool(std::max(nseg, 3));
+    }
+    return pool;
+}
+
+static inline bool rk_tensor_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *)a->data; const char * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *)b->data; const char * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+static void rk_job_quant(ggml_backend_rknpu_context * backend_ctx, RkJob & jb) {
+    UNUSED(backend_ctx);
+    if (!jb.need_quant) return;
+    RKPROF_BEGIN(t_qa);
+    float * sA = jb.scales->data();
+    void * dst_base = jb.A->virt_addr;
+    const int Mt = jb.Mt, K = jb.K, K_op = jb.K_op, K_seg_op = jb.K_seg_op, off_k = jb.offset_k, row_stride = jb.row_stride;
+    const bool is_hadamard = jb.hadamard;
+    const float * x = jb.x; const float * s_vec = jb.s_vec;
+    const int ta = jb.npu_type_a;
+    #pragma omp parallel for num_threads(rknpu_ov_threads())
+    for (int m = 0; m < Mt; ++m) {
+        const float* src_row = x + (size_t)m * row_stride;
+        std::vector<float> ready_row_buf;
+        const float* ready_row = src_row + off_k;
+        if (is_hadamard) {
+            ready_row_buf.resize(K_seg_op);
+            std::vector<float> signed_row(K);
+            std::vector<float> full_hadamard_row(K_op);
+            for (int k = 0; k < K; ++k) signed_row[k] = src_row[k] * s_vec[k];
+            rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
+            memcpy(ready_row_buf.data(), full_hadamard_row.data() + off_k, K_seg_op * sizeof(float));
+            ready_row = ready_row_buf.data();
+        }
+        if (ta == rknpu2_configuration::NPU_TYPE_FP16) {
+            uint16_t* dst_row = (uint16_t*)dst_base + (size_t)m * K_seg_op;
+            rknpu2_quantization::convert_fp32_to_fp16(ready_row, dst_row, K_seg_op);
+        } else if (ta == rknpu2_configuration::NPU_TYPE_INT8) {
+            float amax_m = rknpu_row_amax(ready_row, K_seg_op);
+            sA[m] = amax_m / 127.0f;
+            int8_t* dst_row = (int8_t*)dst_base + (size_t)m * K_seg_op;
+            rknpu_quant_row_i8(ready_row, dst_row, K_seg_op, sA[m]);
+        } else if (ta == rknpu2_configuration::NPU_TYPE_INT4) {
+            float amax_m = rknpu_row_amax(ready_row, K_seg_op);
+            sA[m] = amax_m / 7.0f;
+            uint8_t* dst_row = (uint8_t*)dst_base + (size_t)m * (K_seg_op / 2);
+            rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row, dst_row, K_seg_op, sA[m]);
+        }
+    }
+    RKPROF_END(t_qa, ST_QUANT_A);
+    RKPROF(ST_SYNC_A);
+    RKNN_CHECK(rknn_mem_sync(jb.ctx[0]->ctx, jb.A.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
+}
+
+static void rk_job_dequant(RkJob & jb) {
+    if (jb.deq_done) return;
+    {
+        RKPROF(ST_SYNC_C);
+        for (int idx = 0; idx < jb.nseg; idx++) {
+            RKNN_CHECK(rknn_mem_sync(jb.ctx[idx]->ctx, jb.C[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
+        }
+    }
+    RKPROF(ST_DEQUANT);
+    const float hadamard_divisor = jb.hadamard ? (float)jb.K_op : 1.0f;
+    const int npu_type_c = jb.npu_type_c;
+    const int Mt = jb.Mt, N = jb.N, nseg = jb.nseg, k_idx = jb.k_idx;
+    const bool first_k = jb.first_k;
+    const float * scales_A = jb.scales->data();
+    const float * scales_B_grid = jb.scales_B_grid;
+    float * dst_tile = jb.dst_tile;
+    #pragma omp parallel for num_threads(rknpu_ov_threads())
+    for (int m = 0; m < Mt; m++) {
+        const float sa = scales_A[m] / hadamard_divisor;
+        for (int idx = 0; idx < nseg; idx++) {
+            const int N_offset = jb.n_off[idx];
+            const int N_segment = jb.n_size[idx];
+            const float* wscale = scales_B_grid ? (scales_B_grid + (size_t)k_idx * N + N_offset) : nullptr;
+            float* dst_ptr = dst_tile + (size_t)m * N + N_offset;
+            if (npu_type_c == rknpu2_configuration::NPU_TYPE_FP32) {
+                const float* src_ptr = (const float*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
+                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+            } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT32) {
+                const int32_t* src_ptr = (const int32_t*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
+                if (wscale) {
+                    if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * wscale[n]); }
+                    else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * (sa * wscale[n]); }
+                } else {
+                    if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * sa; }
+                    else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * sa; }
+                }
+            } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT16) {
+                const int16_t* src_ptr = (const int16_t*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
+                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+            }
+        }
+    }
+    jb.deq_done = true;
+}
+
+template <typename Cfg>
+static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context * backend_ctx, struct ggml_cgraph * cgraph, const Cfg & config) {
+    RKPROF(ST_MATMUL);
+    std::vector<RkJob> jobs;
+    jobs.reserve(64);
+    static const bool no_a_reuse = std::getenv("RKNPU_NO_A_REUSE") != nullptr;
+
+    // ---------------- job list (serial prep, same resource/reuse decisions as the serial path) ----------------
+    {
+    RKPROF(ST_SETUP);
+    for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
+        struct ggml_tensor* node = cgraph->nodes[node_i];
+        if (node->op != GGML_OP_MUL_MAT) continue;
+        const struct ggml_tensor* src0 = node->src[0];
+        const struct ggml_tensor* src1 = node->src[1];
+        const int M = (int)src1->ne[1];
+        const int K = (int)src0->ne[0];
+        const int N = (int)src0->ne[1];
+        if (M == 0 || K == 0 || N == 0) continue;
+        const auto* pipeline = config.resolve_op_support(src0);
+        if (!pipeline) continue;
+        const bool is_hadamard = (pipeline->use_hadamard);
+        const int K_op = is_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
+        const rknn_matmul_type matmul_type = pipeline->mm_type;
+        const int alignment = pipeline->n_align;
+        int k_limit = config.max_k_limit;
+        if (pipeline->effective_k > 0) {
+            k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
+        }
+        auto all_k_segments = compute_k_segments(K_op, k_limit, pipeline->k_align);
+        auto all_n_segments = compute_n_segments(N, config.active_cores, alignment);
+        std::vector<MatrixSegmentN> active_n_segments;
+        for (const auto& seg : all_n_segments) if (seg.size_n > 0) active_n_segments.push_back(seg);
+        if (active_n_segments.empty()) continue;
+        GGML_ASSERT(active_n_segments.size() <= RK_MAX_SEG);
+        const int m_tile = rknpu_m_tile() > 0 ? rknpu_m_tile() : M;
+        if (rknpu_prof::enabled()) {
+            rknpu_prof::g.n_matmul++; rknpu_prof::g.macs_real += (double)M*K*N;
+            for (int m0 = 0; m0 < M; m0 += m_tile) { int mt = std::min(m_tile, M - m0); int mo = mt > 1 ? rknpu2_calibration::next_power_of_two(mt) : 1; rknpu_prof::g.macs_op += (double)mo*K_op*N; }
+        }
+        const size_t num_active_segments = active_n_segments.size();
+
+        ggml_backend_buffer_t src0_buffer = src0->buffer;
+        auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
+        size_t tensor_offset_in_virtual = (uintptr_t)src0->data - (uintptr_t)src0_buf_ctx->virtual_base;
+        int32_t b_domain_id = 0;
+        int tensor_fd = -1;
+        void* tensor_virt_addr = nullptr;
+        const float* s_vec = nullptr;
+        const float* scales_B_grid = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
+            auto it = src0_buf_ctx->tensor_allocs.find(tensor_offset_in_virtual);
+            GGML_ASSERT(it != src0_buf_ctx->tensor_allocs.end() && "B-matrix RKNN buffer not found");
+            tensor_fd = it->second.mem->fd;
+            tensor_virt_addr = it->second.mem->virt_addr;
+            b_domain_id = it->second.iommu_domain_id;
+            if (is_hadamard) {
+                auto its = src0_buf_ctx->hadamard_s_vectors.find(src0);
+                GGML_ASSERT(its != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
+                s_vec = its->second.data();
+            }
+            if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) {
+                auto itq = src0_buf_ctx->quantized_tensor_scales.find(src0);
+                GGML_ASSERT(itq != src0_buf_ctx->quantized_tensor_scales.end() && "Quantized scales grid not found");
+                scales_B_grid = itq->second.data();
+            }
+        }
+        float* dst_data = (float*)get_tensor_real_ptr(node);
+        const float* x_all = (const float*)get_tensor_real_ptr(src1);
+        const int row_stride = (int)(src1->nb[1] / sizeof(float));
+        size_t type_size_packed = 0;
+        if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
+        else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
+
+        for (int m0 = 0; m0 < M; m0 += m_tile) {
+            const int Mt = std::min(m_tile, M - m0);
+            const int M_op = Mt > 1 ? rknpu2_calibration::next_power_of_two(Mt) : 1;
+            size_t current_offset_in_tensor = 0;
+            for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
+                const auto& k_seg = all_k_segments[k_idx];
+                const int K_seg_op = k_seg.size_k;
+                RkJob jb;
+                jb.node = node; jb.src1 = src1;
+                jb.M_op = M_op; jb.Mt = Mt; jb.K = K; jb.K_op = K_op; jb.N = N; jb.K_seg_op = K_seg_op;
+                jb.offset_k = k_seg.offset_k; jb.k_idx = (int)k_idx; jb.first_k = (k_idx == 0); jb.hadamard = is_hadamard;
+                jb.npu_type_a = (int)pipeline->npu_type_a; jb.npu_type_c = (int)pipeline->npu_type_c;
+                jb.x = x_all + (size_t)m0 * row_stride; jb.dst_tile = dst_data + (size_t)m0 * N; jb.row_stride = row_stride;
+                jb.s_vec = s_vec; jb.scales_B_grid = scales_B_grid;
+                jb.nseg = (int)num_active_segments;
+
+                // 1. contexts + B binding
+                for (const auto& n_seg : all_n_segments) {
+                    for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                        if (active_n_segments[idx].offset_n == n_seg.offset_n) {
+                            size_t offset_in_dma = current_offset_in_tensor;
+                            {
+                            RKPROF(ST_CTX);
+                            jb.ctx[idx] = backend_ctx->get_matmul_ctx((uintptr_t)tensor_virt_addr, offset_in_dma, M_op, K_seg_op, n_seg.size_n,
+                                                                      n_seg.core_id, matmul_type, b_domain_id);
+                            }
+                            if (!jb.ctx[idx] || jb.ctx[idx]->ctx == 0) return GGML_STATUS_FAILED;
+                            auto& matmul_ctx = jb.ctx[idx];
+                            if (!matmul_ctx->b_bound) {
+                                RKPROF(ST_BIND_B);
+                                if (rknpu_prof::enabled()) rknpu_prof::g.n_b_bind++;
+                                size_t segment_size_bytes = matmul_ctx->io_attr.B.size;
+                                rknn_tensor_mem* mem = rknn_create_mem_from_fd(matmul_ctx->ctx, tensor_fd, tensor_virt_addr, segment_size_bytes, offset_in_dma);
+                                if (!mem) return GGML_STATUS_FAILED;
+                                auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
+                                matmul_ctx->mem_B = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
+                                RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
+                                matmul_ctx->b_bound = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (n_seg.size_n > 0) {
+                        current_offset_in_tensor += type_size_packed > 0 ? (size_t)n_seg.size_n * K_seg_op * type_size_packed : (size_t)n_seg.size_n * K_seg_op / 2;
+                    }
+                }
+                for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                    jb.n_off[idx] = active_n_segments[idx].offset_n; jb.n_size[idx] = active_n_segments[idx].size_n;
+                }
+
+                // 2. A buffer + reuse decision (quantization itself happens later, in job order)
+                {
+                    auto cache_key = std::make_tuple(M_op, K_seg_op, (int)pipeline->npu_type_a, b_domain_id, m0, k_seg.offset_k);
+                    {
+                    RKPROF(ST_GET_A);
+                    jb.A = get_tensor_buffer(backend_ctx, jb.ctx[0]->ctx, jb.ctx[0]->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+                    }
+                    if (!jb.A) return GGML_STATUS_FAILED;
+                    auto& astate = backend_ctx->a_state[jb.A.get()];
+                    const bool reuse = astate.epoch == backend_ctx->graph_epoch && astate.src1 == src1 && astate.data == src1->data &&
+                                       astate.Mt == Mt && astate.pipeline_a == (int)pipeline->npu_type_a && astate.hadamard == is_hadamard &&
+                                       astate.s_vec == s_vec && astate.sp && !no_a_reuse;
+                    if (reuse) {
+                        if (rknpu_prof::enabled()) rknpu_prof::g.n_a_reuse++;
+                        jb.need_quant = false;
+                    } else {
+                        jb.need_quant = true;
+                        astate.sp = std::make_shared<std::vector<float>>(Mt, 1.0f);
+                        astate.epoch = backend_ctx->graph_epoch; astate.src1 = src1; astate.data = src1->data; astate.Mt = Mt;
+                        astate.pipeline_a = (int)pipeline->npu_type_a; astate.hadamard = is_hadamard; astate.s_vec = s_vec;
+                    }
+                    jb.scales = astate.sp;
+                }
+
+                // 3. C buffers: double-buffered by job parity
+                {
+                    const int slot = (int)(jobs.size() & 1);
+                    for (size_t idx = 0; idx < num_active_segments; idx++) {
+                        auto cache_key = std::make_tuple(M_op, active_n_segments[idx].size_n, active_n_segments[idx].core_id,
+                                                         (int)pipeline->npu_type_c + 1000 * (slot + 1), b_domain_id);
+                        jb.C[idx] = get_tensor_buffer(backend_ctx, jb.ctx[idx]->ctx, jb.ctx[idx]->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                        if (!jb.C[idx]) return GGML_STATUS_FAILED;
+                    }
+                }
+                jobs.push_back(std::move(jb));
+            }
+        }
+    }
+    }
+    const int J = (int)jobs.size();
+    if (J == 0) return GGML_STATUS_SUCCESS;
+    int max_seg = 0;
+    for (auto & jb : jobs) max_seg = std::max(max_seg, jb.nseg);
+    RkNpuPool * pool = rknpu_get_pool(max_seg);
+    const bool prof = rknpu_prof::enabled();
+
+    auto setio_submit = [&](RkJob & jb) {
+        {
+        RKPROF(ST_SETIO_A);
+        for (int idx = 0; idx < jb.nseg; idx++)
+            RKNN_CHECK(rknn_matmul_set_io_mem(jb.ctx[idx]->ctx, jb.A.get(), &jb.ctx[idx]->io_attr.A), "set_io_mem A for core");
+        }
+        {
+        RKPROF(ST_SETIO_C);
+        for (int idx = 0; idx < jb.nseg; idx++)
+            RKNN_CHECK(rknn_matmul_set_io_mem(jb.ctx[idx]->ctx, jb.C[idx].get(), &jb.ctx[idx]->io_attr.C), "set_io_mem C");
+        }
+        if (prof) jb.t_submit = rknpu_prof::now_ms();
+        pool->submit(&jb);
+    };
+    auto wait_run = [&](RkJob & jb) {
+        {
+        RKPROF(ST_RUN);   // overlap mode: exposed (main-thread blocked) NPU wait
+        pool->wait();
+        }
+        if (prof) {
+            double mx = 0, sm = 0, end = jb.t_submit, st = 0;
+            for (int idx = 0; idx < jb.nseg; idx++) { sm += jb.core_ms[idx]; mx = std::max(mx, jb.core_ms[idx]); end = std::max(end, jb.core_end[idx]); st = std::max(st, jb.core_start[idx] - jb.t_submit); }
+            rknpu_prof::g.ov_start_lat += st; rknpu_prof::g.ov_notice_lat += rknpu_prof::now_ms() - end;
+            rknpu_prof::g.run_core_sum += sm; rknpu_prof::g.run_core_max_sum += mx;
+            rknpu_prof::g.n_run += jb.nseg;
+            rknpu_prof::g.ov_busy += end - jb.t_submit; rknpu_prof::g.ov_jobs++;
+            auto & e = rknpu_prof::g.run_by_shape[std::make_tuple(jb.M_op, jb.K_seg_op, jb.N)];
+            e.first++; e.second += end - jb.t_submit;
+        }
+    };
+
+    rk_job_quant(backend_ctx, jobs[0]);
+    for (int j = 0; j < J; ++j) {
+        RkJob & cur = jobs[j];
+        setio_submit(cur);
+        bool waited = false;
+        if (j > 0) rk_job_dequant(jobs[j - 1]);
+        if (j + 1 < J) {
+            RkJob & nx = jobs[j + 1];
+            if (nx.need_quant) {
+                const bool conflict_a = nx.A.get() == cur.A.get();
+                const bool dep = rk_tensor_overlap(nx.src1, cur.node);
+                if (conflict_a || dep) {
+                    wait_run(cur); waited = true;
+                    if (prof) { if (dep) rknpu_prof::g.ov_stall_dep++; else rknpu_prof::g.ov_stall_a++; }
+                    if (dep) rk_job_dequant(cur);
+                }
+                rk_job_quant(backend_ctx, nx);
+            }
+        }
+        if (!waited) wait_run(cur);
+    }
+    rk_job_dequant(jobs[J - 1]);
+    return GGML_STATUS_SUCCESS;
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
@@ -625,6 +1107,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     // A-buffer reuse is only valid inside one graph_compute call (one scheduler split):
     // the same src1 tensor (q/k/v, gate/up) is quantized once per (tile, K segment).
     backend_ctx->graph_epoch++;
+
+    if (rknpu_overlap()) return rknpu_graph_compute_overlap(backend_ctx, cgraph, config);
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
