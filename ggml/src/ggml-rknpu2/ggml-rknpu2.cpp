@@ -487,9 +487,30 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// opt2 (2026-09-25): host-visible compute buffers. The RKNPU buffer memory behind activations/dst is plain
+// anonymous host memory (only packed weights live in separate DMA buffers), and graph_compute reads src1 / writes dst
+// with the CPU (quantize / dequant) anyway. With RKNPU_HOST_COMPUTE=1 (default):
+//   - the buffer type reports is_host = true, so the CPU backend reads RKNPU split outputs in place
+//     (no RKNPU->CPU get_tensor memcpy),
+//   - supports_buft also accepts host buffer types, so matmul activations are read straight from CPU buffers
+//     (no CPU->RKNPU set_tensor memcpy).
+// Weights are still uploaded via set_tensor (mmap load path); the NPU A/C DMA buffers keep their explicit mem_sync.
+// Note: is_host also affects llama's --no-mmap load path (raw read into tensor->data); that path is not supported
+// with RKNPU_HOST_COMPUTE=1 (packed weights would never be built; the int8 scale lookup asserts).
+static bool rknpu_host_compute() {
+    static const bool v = [](){ const char* e = std::getenv("RKNPU_HOST_COMPUTE"); return e ? std::atoi(e) != 0 : true; }();
+    return v;
+}
+static const char * ggml_backend_rknpu_buffer_type_get_name(ggml_backend_buffer_type_t buft);
+static inline bool rknpu_is_rknpu_buffer(const ggml_backend_buffer_t buf) {
+    return buf && buf->buft && buf->buft->iface.get_name == ggml_backend_rknpu_buffer_type_get_name;
+}
+
 // Function for acquiring a pointer for tensor data
 static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
     if (!tensor || !tensor->data) return nullptr;
+    // tensors in foreign (CPU host) buffers: data pointer is directly usable
+    if (!rknpu_is_rknpu_buffer(tensor->view_src ? tensor->view_src->buffer : tensor->buffer)) return tensor->data;
 
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* pipeline = config.resolve_op_support(tensor);
@@ -1580,7 +1601,7 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
         /* .get_alignment  = */ ggml_backend_rknpu_buffer_type_get_alignment,
         /* .get_max_size   = */ NULL,
         /* .get_alloc_size = */ ggml_backend_rknpu_buffer_type_get_alloc_size,
-        /* .is_host        = */ NULL,
+        /* .is_host        = */ [](ggml_backend_buffer_type_t buft) { UNUSED(buft); return rknpu_host_compute(); },
     };
 
     static struct ggml_backend_buffer_type rknpu_buffer_type = {
@@ -1600,7 +1621,10 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
         /* .get_host_buffer_type = */ NULL,
         /* .buffer_from_host_ptr = */ NULL,
         /* .supports_op          = */ ggml_backend_rknpu_device_supports_op,
-        /* .supports_buft        = */ [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) { UNUSED(dev); return buft == &rknpu_buffer_type; },
+        /* .supports_buft        = */ [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+            UNUSED(dev);
+            return buft == &rknpu_buffer_type || (rknpu_host_compute() && ggml_backend_buft_is_host(buft));
+        },
         /* .offload_op           = */ NULL,
         /* .event_new            = */ NULL,
         /* .event_free           = */ NULL,
