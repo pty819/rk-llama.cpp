@@ -1,3 +1,7 @@
+> [!NOTE]
+> **Orange Pi 5 (RK3588S) NPU embedding optimizations** (branch `opi5-rknpu2-embed-opt`): see [docs/opi5/README.md](docs/opi5/README.md).
+> Based on [javer/rk-llama.cpp](https://github.com/javer/rk-llama.cpp) and the ggml-rknpu2 backend by [invisiofficial](https://github.com/invisiofficial/rk-llama.cpp).
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
