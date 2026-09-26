@@ -1277,10 +1277,11 @@ inline static float32x4_t v_expf(float32x4_t x) {   // same as ggml_v_expf
     return vbslq_f32(vcagtq_f32(n, vdupq_n_f32(192)), vmulq_f32(s1, s1),
                      vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)));
 }
-enum { F_MASK, F_GATHER, F_QFILL, F_BIND, F_RUNQK, F_SOFTMAX, F_RUNPV, F_OUT, F_N };
+enum { F_MASK, F_GATHER, F_QFILL, F_BIND, F_RUNQK, F_SSYNC, F_SMAX, F_SEXP, F_GEN, F_PSYNC, F_RUNPV, F_OUT, F_N };
 static double ft[F_N]; static long f_n = 0; static double f_wall = 0; static double f_cols = 0, f_cols_noskip = 0;
-static const char * fname[F_N] = {"mask scan (wall)", "K/V gather+sync (wall)", "Q fill+sync (thr)", "bind (thr)", "run QK (thr)",
-                                  "softmax+syncs (thr)", "run PV (thr)", "O sync+scale (thr)"};
+static const char * fname[F_N] = {"mask scan (wall)", "K/V gather+sync (wall)", "Q fill+sync (thr)", "bind+B fill (thr)", "run QK (thr)",
+                                  "S sync (thr)", "softmax max (thr)", "softmax exp+P (thr)", "softmax generic (thr)", "P sync (thr)",
+                                  "run PV (thr)", "O sync+scale (thr)"};
 static void dump_prof() {
     if (f_n == 0) return;
     fprintf(stderr, "[RKNPU_PROFILE] NPU FA: nodes=%ld wall=%.2f ms (%.3f ms/node) contexts live=%zu created=%ld evicted=%ld (create %.1f ms total)\n", f_n, f_wall, f_wall / f_n, ctxs.size(), n_create, n_evict, create_ms);
@@ -1376,7 +1377,10 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     if ((int)kbuf.size() < Hkv) { kbuf.resize(Hkv); vbuf.resize(Hkv); }
     if ((int)tbs.size() < nthr) tbs.resize(nthr);
     const size_t Mmax = (size_t)ratio * mt;
-    for (int g = 0; g < Hkv; g++) if (!ensure(kbuf[g], (size_t)kvcap * D * 2) || !ensure(vbuf[g], (size_t)kvcap * D * 2)) return GGML_STATUS_FAILED;
+    for (int g = 0; g < Hkv; g++) {
+        if (!ensure(kbuf[g], (size_t)kvcap * D * 2)) return GGML_STATUS_FAILED;   // native K or legacy K rows
+        if (!nat && !ensure(vbuf[g], (size_t)kvcap * D * 2)) return GGML_STATUS_FAILED;   // legacy-only
+    }
     for (int t = 0; t < nthr; t++) {
         TB & b = tbs[t];
         if (!ensure(b.q, Mmax * D * 2) || !ensure(b.s, Mmax * kvcap * 4) || !ensure(b.p, Mmax * kvcap * 2) || !ensure(b.o, Mmax * D * 4)) return GGML_STATUS_FAILED;
@@ -1457,10 +1461,14 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             if (rknn_matmul_run(cq->ctx) < 0) { failed = true; break; }
             double t3 = prof ? rknpu_prof::now_ms() : 0;
             if (rknn_mem_sync(cq->ctx, b.s.m, RKNN_MEMORY_SYNC_FROM_DEVICE) < 0) { failed = true; break; }
+            double t3a = prof ? rknpu_prof::now_ms() : 0;
             // ---- softmax over native S (Nq/4, M, 4) -> native P (Nq/8, M, 8) ----
+            // (Range-restricted row iteration was tried here - bit-identical, fewer pairs - but measured neutral on
+            // mixed batches and ~3% slower end to end on long inputs: with two submitter threads per NPU core the CPU
+            // softmax overlaps the other thread's matmul, so the pipeline is NPU-bound and CPU savings turn into sync
+            // wait. Kept the original full scan; see the split profiler columns below for the breakdown.)
             const float * S = (const float *)b.s.m->virt_addr; __fp16 * P = (__fp16 *)b.p.m->virt_addr;
             auto row_tok = [&](int r, int & t) -> bool { const int i = r % jb.mtp; t = jb.r0 + i; return i < jb.mtc; };
-            for (int r = 0; r < M; r++) b.mx4[r] = ninf;
             for (int n4 = 0; n4 < Nq / 4; n4++) {
                 const int j0 = n4 * 4;
                 const float * Sb = S + (size_t)n4 * M * 4;
@@ -1477,6 +1485,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 }
             }
             for (int r = 0; r < M; r++) { const float m = vmaxvq_f32(b.mx4[r]); b.mx4[r] = vdupq_n_f32(std::isinf(m) ? 0.f : -m * scale); b.sm4[r] = zero; }
+            double t3b = prof ? rknpu_prof::now_ms() : 0;
             for (int n8 = 0; n8 < Nq / 8; n8++) {
                 const int j0 = n8 * 8;
                 const float * Sb0 = S + (size_t)(2 * n8) * M * 4, * Sb1 = S + (size_t)(2 * n8 + 1) * M * 4;
@@ -1498,6 +1507,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 }
             }
             for (int r = 0; r < M; r++) { const float s = vaddvq_f32(b.sm4[r]); b.inv[r] = s > 0.f ? 1.0f / s : 0.f; }
+            double t3c = prof ? rknpu_prof::now_ms() : 0;
             // exact generic path for rows with non-trivial mask values inside their range
             for (int r = 0; r < M; r++) {
                 int t; if (!row_tok(r, t) || row_clean[t]) continue;
@@ -1518,6 +1528,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 }
                 b.inv[r] = sum > 0 ? (float)(1.0 / sum) : 0.f;
             }
+            double t3d = prof ? rknpu_prof::now_ms() : 0;
             if (rknn_mem_sync(cv->ctx, b.p.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
             double t4 = prof ? rknpu_prof::now_ms() : 0;
             if (rknn_matmul_run(cv->ctx) < 0) { failed = true; break; }
@@ -1533,7 +1544,8 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             }
             if (prof) {
                 double t6 = rknpu_prof::now_ms();
-                ta[F_QFILL] += t1 - t0; ta[F_BIND] += t2 - t1; ta[F_RUNQK] += t3 - t2; ta[F_SOFTMAX] += t4 - t3; ta[F_RUNPV] += t5 - t4; ta[F_OUT] += t6 - t5;
+                ta[F_QFILL] += t1 - t0; ta[F_BIND] += t2 - t1; ta[F_RUNQK] += t3 - t2; ta[F_SSYNC] += t3a - t3; ta[F_SMAX] += t3b - t3a;
+                ta[F_SEXP] += t3c - t3b; ta[F_GEN] += t3d - t3c; ta[F_PSYNC] += t4 - t3d; ta[F_RUNPV] += t5 - t4; ta[F_OUT] += t6 - t5;
             }
         }
     };
