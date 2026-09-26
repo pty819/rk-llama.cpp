@@ -19,7 +19,10 @@
 | `ggml-cpu` | 新的 NEON fp16 flash-attention kernel（K/V 直接读 f16 cache、fp16 FMA 短链 + fp32 累加、heavy-first 调度、mask tile 分类，单层 FA 快约 2.4 倍）；可选的逐 op profiler | `GGML_FA_OPT1`、`GGML_FA_OPT1_PACK`、`GGML_FA_OPT1_QKCHUNK`、`GGML_CPU_OPPROF` |
 | `ggml-rknpu2` host compute | RKNPU buffer 报告 `is_host`，CPU↔RKNPU 之间不再做 scheduler 拷贝（每次 forward 省 1.2–2.2 GB memcpy） | `RKNPU_HOST_COMPUTE`（默认 1） |
 | `ggml-rknpu2` overlap | A 量化 / C 反量化与 NPU matmul 流水线重叠（实验性，收益约 100–150 ms/forward，默认 **关闭**） | `RKNPU_OVERLAP=1` |
-| `ggml-rknpu2` NPU attention | `FLASH_ATTN_EXT` 在 NPU 上跑：Q·Kᵀ 和 P·V 用 NPU fp16 matmul（native A/C layout，K 用 TP_NORM B），mask + softmax 在 CPU（NEON），256 行 query tile、GQA 两个 Q head 叠在 M 上、按真实 mask 跳过全遮蔽块，6 个驱动线程（每个 NPU core 2 个），context 缓存以 256 key 为粒度（任何长度的 context 集合都是最大长度集合的子集），有上限 | `RKNPU_FA=1`（默认关） |
+| `ggml-rknpu2` NPU attention | `FLASH_ATTN_EXT` 在 NPU 上跑：Q·Kᵀ 和 P·V 用 NPU fp16 matmul（native A/C layout），mask + softmax 在 CPU（NEON），256 行 query tile、GQA 两个 Q head 叠在 M 上、按真实 mask 跳过全遮蔽块，6 个驱动线程（每个 NPU core 2 个），context 缓存以 256 key 为粒度（任何长度的 context 集合都是最大长度集合的子集），有上限 | `RKNPU_FA=1`（默认关） |
+| `ggml-rknpu2` tile 级 key 起点跳过 | 多序列打包的 batch 里，每个 query tile 从它第一条未被遮蔽的 key 开始算（对齐到 tile 粒度），不再从 key 0 开始。k0 > 0 的任务把 K/V 窗口拷进各线程自己的暂存缓冲（fd 偏移视图在两个驱动线程并发时结果会错，不能直接绑偏移）。输出与不跳过时逐字节一致 | `RKNPU_FA_KSKIP`（默认 1；0 = 关） |
+| `ggml-rknpu2` B 原生布局绑定 | QK/PV matmul 的 B 直接用 NPU 原生布局（RK3588 fp16：`(N/16, K/32, 16, 32)`），`set_io_mem` 不再在 CPU 上转换 B（实测 4.9 µs vs 186 µs/次）。K 侧原生布局对 Nq 前缀兼容（每个 KV head 一个共享缓冲）；V 侧不兼容（步长依赖 Nq），每个 PV 任务自己交织暂存。原生 B 在 run 时直读内存（板上探针验证），绑定只认缓冲指针。旧路径完整保留 | `RKNPU_FA_NATIVE_B`（默认 1；0 = 旧路径） |
+| `ggml-rknpu2` softmax profiler 细分 + 省内存 | `softmax+syncs` 一列拆成 S sync / softmax max / softmax exp+P / generic / P sync 五列（mixed-40：7% / 36% / 53% / 0.1% / 4%）。曾实现逐行范围裁剪的 softmax（值逐位一致、causal tile 少算约一半配对），实测 mixed-40 持平、1975 token 慢约 3%、`RKNPU_FA_THREADS=3` 慢约 12%——每核 2 个提交线程时 CPU softmax 与另一线程的 NPU matmul 重叠，流水线是 NPU 吞吐瓶颈，CPU 侧节省都变成同步等待，故回退（证据留在代码注释）。native 模式下不再分配 legacy vbuf | `RKNPU_PROFILE=1` |
 | `llama-context` | 3 行补丁：`flash_attn = auto` 时，如果 FA 节点被分配到 ACCEL 设备（RKNPU），而该层在 CPU 上，不再把 FA 整体关掉（RKNPU 直接在 host 内存上计算） | – |
 
 ## 2. 环境要求
@@ -84,6 +87,8 @@ curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `RKNPU_FA` | 0 | 1 = `FLASH_ATTN_EXT` 在 NPU 上跑（本分支推荐开启）；0 = 原来的 CPU FA，输出和关闭前逐字节一致 |
+| `RKNPU_FA_KSKIP` | 1 | 1 = 多序列 batch 里每个 tile 从自己的第一条 key 开始算（对齐 tile 粒度）；0 = 从 key 0 开始。两种模式输出逐字节一致 |
+| `RKNPU_FA_NATIVE_B` | 1 | 1 = K/V 以 NPU 原生布局绑定（set_io_mem 不做 CPU 转换）；0 = 旧路径（TP_NORM/普通布局，每次绑定转换）。启动时自动探测，失败也回旧路径；两种模式输出逐字节一致 |
 | `RKNPU_FA_MAX_KV` | 4096 | key 长度超过它时 `supports_op` 拒绝，回退到 CPU FA（上限 8192）。这是最主要的内存上限开关 |
 | `RKNPU_FA_MAX_CTX` | 192 | NPU attention context 数量硬上限（每个驱动线程各自做 LRU 淘汰）。设得太小会反复重建 context，明显变慢 |
 | `RKNPU_FA_THREADS` | 6 | NPU attention 驱动线程数（每个 NPU core 2 个） |
@@ -127,6 +132,26 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
 | 1023 | 501 | 584 | **+17%** | 340 | 362 | 2078 → 2113 MB |
 | 1975 | 346 | 471 | **+36%** | 264 | 320 | 2812 → 2885 MB |
 
+### tile key 跳过 + B 原生布局合入后（2026-09-26 晚复测，板温 77–81 °C，同轮交错）
+
+本轮板温比上一轮高约 5 °C，绝对值整体下移（CPU FA 关侧也低约 15%），比率才有可比性。
+
+| tokens | 关，warm | 开，warm | 变化 | peak RSS 关 → 开 |
+|---|---|---|---|---|
+| 1023 | 392 | 449 | **+15%** | 2078 → 2104–2108 MB |
+| 1975 | 293 | 366 | **+25%** | 2809 → 2859 MB（vbuf 不再分配，比上一轮少 +26 MB） |
+
+混合 batch（40 条 100–2000 token 随机文本，19 个 batch，中位数，`RKNPU_FA_THREADS=6`）：
+
+| 模式 | warm tok/s | 说明 |
+|---|---|---|
+| FA 关（CPU） | 346 | |
+| FA 开 + KSKIP=0 | 362 | 与关比 +4.7% |
+| FA 开（默认，KSKIP=1 + native B） | **381** | 与关比 **+10%**，与不跳 key 比 +5% |
+
+长输入 `RKNPU_FA_CHECK`（最终二进制）：56/56 层 cosine = 1.000000；混合 batch：532/532 层 cosine = 1.000000。
+与 CPU 参考的 cosine 和上一轮相同（长文本 0.9972–0.9975；混合 40 条 on vs off min 0.99115 / mean 0.998，与改动前逐位同签名）。
+
 - 每层 attention：1023 token 时 21.9 ms（CPU FA 34.7 ms），1975 token 时 78 ms（CPU FA 约 125 ms）。
 - cosine（和 CPU Q8_0 参考比）：长文本 FA 关 0.99734–0.99740，开 0.99708–0.99725；短文本最低 FA 关 0.99643，开 0.99624。全部 ≥ 0.996，但短文本最低值离门限很近。
 - `RKNPU_FA_CHECK` 逐层和 fp32 参考比较：每层 cosine 1.000000，最大绝对误差 ≤ 0.024。
@@ -135,7 +160,7 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
 ## 7. 内存
 
 - 每个 NPU attention context 约 0.3–0.5 MB（96 个 context：VmRSS +36.5 MB，其中 RssShmem +28.4 MB；不占 CMA）。
-- attention 缓冲区按见过的最长 key 长度分配一次，之后复用：2048 key 时约 47 MB。
+- attention 缓冲区按见过的最长 key 长度分配一次，之后复用：2048 key 时约 47 MB。native-B 模式下 legacy 的 vbuf 暂存不再分配（2048 key 时省 4 MB，`RKNPU_FA_MAX_KV=4096` 时省 8 MB）。
 - 1975 token 时 NPU attention 总共多占约 75–85 MB（peak RSS 2812 → 2885–2897 MB）。
 - 上限：context 数 ≤ 6 线程 × 2 × (max_kv / 256)，2048 时是 96，`RKNPU_FA_MAX_KV=4096` 时最多 192（约 80 MB），再加约 90 MB 缓冲区。和输入长度有多少种无关。
 - 长时间运行：40 条 100–2000 token 的随机文本（打包成 19 个 batch，每个 batch 1–5 条序列）在同一个进程里跑完。context 数第一个 batch 之后就固定在 96，
@@ -143,16 +168,15 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
 
 ## 8. 已知限制
 
-- **多条序列打包的 batch 收益很小**：CPU FA 本来就会跳过被遮蔽的 key，而当前 NPU 版本每个 tile 都从 key 0 开始算。40 条随机文本的测试里，总耗时 FA 开 88 s，关 91 s。
-  （下一步：每个 tile 从它第一条序列的起点开始算。）
 - **首个 batch 的 context 创建开销**：每次出现新的 key 长度时要创建 context，547 / 1023 / 1975 token 分别约 36 / 52 / 141 ms。177 token 这种单次短 batch 开 FA 反而稍慢。
+- **CPU softmax 不是流水线瓶颈，别再从这里挤速度**：profiler 细分显示 softmax 计算占该段 89%，但逐行范围裁剪的优化（值逐位一致）实测 e2e 持平或更慢——每核 2 个提交线程时，一个线程的 CPU softmax 正好覆盖另一个线程的 NPU matmul，流水线是 NPU 吞吐瓶颈。想再快只能把 softmax（或整个 FA）搬到 NPU 上融合。
 - **需要 3 行 `llama-context` 补丁**：没有它时，`flash_attn = auto` 遇到 RKNPU 上的 FA 节点会把 flash attention 整体关掉（CPU FA 也一起关，变得更慢）。
 - **发热降频**：满载时板子到 75–80 °C，warm 吞吐会有明显波动（例如 1975 token、FA 关，从 346 掉到 278–301 tok/s）。建议主动散热。
 - 随机截取的文本片段（从句子中间开始）和 CPU 参考的 cosine 更低：40 条里有 19 条低于 0.996，FA 关的时候也一样（最低 0.988）。开启 NPU attention 后平均值基本不变（0.9948 vs 0.9950）。
 - 只测了 Qwen3-0.6B（jina-v5-small）这种形状：head_dim 128、GQA 16/8、causal。其他 head_dim（32 的倍数且 ≤ 256）会走 NPU 路径，但没有验证过；
   ALiBi、softcap、sinks、非 F16 KV cache 会自动回退到 CPU。
 - `--no-mmap` 需要同时设 `RKNPU_HOST_COMPUTE=0`（见上文）。
-- 开启 `RKNPU_FA` 时，第一个（cold）batch 的结果偶尔有很小的 run-to-run 差异（同一输入 cos 0.99697 vs 0.99709，都 ≥ 0.996）；warm batch 和多 batch 的长时间运行在重复测试中逐字节一致。
+- 开启 `RKNPU_FA` 时，第一个（cold）batch 的结果偶尔有很小的 run-to-run 差异（同一输入 cos 0.99697 vs 0.99709，都 ≥ 0.996）；warm batch 和多 batch 的长时间运行在重复测试中逐字节一致。磁盘 I/O 压力大的时间窗里这个差异更容易出现（曾实测同一天安静时段 6 连跑逐字节一致，重 I/O 时段同二进制两轮之间 min cos 0.9975）；逐层 `RKNPU_FA_CHECK` 始终是 1.000000。
 
 ## 9. 工具
 
