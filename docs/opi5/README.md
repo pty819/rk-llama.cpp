@@ -178,7 +178,9 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
 
 \* 这是 `llama-embedding` CLI 的批处理记账数字（两条 1023-token 文本打包处理的总 token ÷ 总时长，冷+温混合），
 **不是单条长请求的稳态吞吐，偏乐观约 2×**。端到端参考（llama-server HTTP，单并发、~1235 token/条、warm、54–57 °C，
-同夜 IO 压力窗口内）：单并发 **~430–480 tok/s**；纯前向（CLI 单条 ~1235 token，FA 墙钟 + matmul）约 575–810 tok/s。
+同夜 IO 压力窗口内）：单并发 **~430–480 tok/s**；CLI 单条同长度纯前向（FA 墙钟 + matmul）
+约 440–580 tok/s（context 冷热决定）——**server 与 CLI 在同等负载形状下吞吐相同**，
+server 固定开销（HTTP+JSON+分词+排队）实测仅 ~38 ms/条（3-token 请求全程），JSON 序列化 ~1–2 ms。
 绝对值受温度窗口（±15–20%）和板上后台 IO（hermes 等，IO 压力可再压 20%+）影响，只有同窗口相对值可比。
 并发：长文本双 slot 聚合吞吐反而 −25%（单请求已把 CPU+NPU 流水线吃满）；~250 token 短文本双 slot +0–10%。
 
