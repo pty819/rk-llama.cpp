@@ -24,6 +24,7 @@
 | `ggml-rknpu2` B 原生布局绑定 | QK/PV matmul 的 B 直接用 NPU 原生布局（RK3588 fp16：`(N/16, K/32, 16, 32)`），`set_io_mem` 不再在 CPU 上转换 B（实测 4.9 µs vs 186 µs/次）。K 侧原生布局对 Nq 前缀兼容（每个 KV head 一个共享缓冲）；V 侧不兼容（步长依赖 Nq），每个 PV 任务自己交织暂存。原生 B 在 run 时直读内存（板上探针验证），绑定只认缓冲指针。旧路径完整保留 | `RKNPU_FA_NATIVE_B`（默认 1；0 = 旧路径） |
 | `ggml-rknpu2` softmax profiler 细分 + 省内存 | `softmax+syncs` 一列拆成 S sync / softmax max / softmax exp+P / generic / P sync 五列（mixed-40：7% / 36% / 53% / 0.1% / 4%）。曾实现逐行范围裁剪的 softmax（值逐位一致、causal tile 少算约一半配对），实测 mixed-40 持平、1975 token 慢约 3%、`RKNPU_FA_THREADS=3` 慢约 12%——每核 2 个提交线程时 CPU softmax 与另一线程的 NPU matmul 重叠，流水线是 NPU 吞吐瓶颈，CPU 侧节省都变成同步等待，故回退（证据留在代码注释）。native 模式下不再分配 legacy vbuf | `RKNPU_PROFILE=1` |
 | `llama-context` | 3 行补丁：`flash_attn = auto` 时，如果 FA 节点被分配到 ACCEL 设备（RKNPU），而该层在 CPU 上，不再把 FA 整体关掉（RKNPU 直接在 host 内存上计算） | – |
+| `ggml-rknpu2` W8A8_HADAMARD 定型（生产默认） | 激活侧 Hadamard 旋转的三个修复：NEON 融合 FWHT（bit-exact，quantize A 644→224 ms/forward）；符号向量从堆地址种子改为按 K_op 的确定性种子（修复嵌入跨重启漂移）；符号向量按 K_op 共享（q/k/gate/up 旋转后激活一致，恢复 A-reuse）。精度 ≥0.99（fp16 真值仲裁）+ 1089 tok/s，NPU buffer 仅 W16A16 一半 | `RKNPU_HYBRID=W8A8_HADAMARD` |
 
 ## 2. 环境要求
 
@@ -62,7 +63,7 @@ RKNPU_FA=1 taskset -c 4-7 ./build/bin/llama-embedding \
 
 ```sh
 ulimit -n 65536
-RKNPU_FA=1 taskset -c 4-7 ./build/bin/llama-server \
+RKNPU_HYBRID=W8A8_HADAMARD RKNPU_FA=1 taskset -c 4-7 ./build/bin/llama-server \
   -m v5-small-retrieval-Q8_0.gguf --embedding --pooling last \
   -c 2048 -b 2048 -ub 2048 -np 1 -t 4 --host 127.0.0.1 --port 8080
 
@@ -161,6 +162,26 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
 - `RKNPU_FA_CHECK` 逐层和 fp32 参考比较：每层 cosine 1.000000，最大绝对误差 ≤ 0.024。
 - 测试时板子上有其他常驻进程在做磁盘 I/O，温度 70–80 °C。个别 warm 运行被 I/O 卡住（两种模式都有，60–270 tok/s），这些点没有算进中位数。
 
+### 量化管线精度仲裁：W8A8 短文本退化、W8A16 不存在，与 W8A8_HADAMARD 生产配置（2026-09-26 深夜）
+
+以官方 fp16 MLX 模型为真值（Mac 本地直跑）的最终仲裁（cos，7 用例：中/英/俄/日 + 短/长/混合）：
+
+| 管线 | min cos（vs fp16 真值） | 2046 tok prompt eval* | NPU buffer |
+|---|---|---|---|
+| W8A8_STANDARD（上游默认） | 0.44–0.92（短文本/多语种明显退化） | 1267 tok/s | ~420 MB |
+| W16A16_STANDARD | ≥ 0.990 | 940 tok/s | ~840 MB |
+| **W8A8_HADAMARD（生产默认）** | **≥ 0.9897** | **1089 tok/s** | ~420 MB |
+
+\* 同一温度窗口内 `llama-embedding` 的 perf 数字；绝对值随窗口 ±15–20%，只有同窗口的相对值可比。
+
+- **W8A8 的精度问题在激活不在权重**：per-row 单 scale 的 int8 激活量化 × 28 层 × last-token pooling，对短输入/多语种敏感。
+- **字面意义的 W8A16 在本平台不存在**：板上探针遍历 `rknn_matmul_type` 1–15，混合精度的 5（FP16×INT8→FP32）、6（FP16×INT8→FP16）、7、8、11、12 全部返回 `-5 unsupported matmul dtype`；支持的只有 1/2/4（纯 fp16）、2/3/9（纯 int8）、10（纯 int4）。fp16 权重的 2× 字节流量也使 W16A16 的 `matmul_run` 固定为 int8 的 ~1.78×（914 vs 514 ms/forward，NPU 带宽决定，CPU 侧不可回收）。
+- **W8A8_HADAMARD 是第三条路**：QuaRot 式旋转（加载时权重按随机符号 + Hadamard 旋转打包，运行时激活同样旋转后 int8 量化，epilogue 除以 K_op），int8 的权重流量 + 接近 fp16 的精度。定型时修了三件事：
+  1. **NEON 融合 FWHT**：原实现是标量蝶形 + 每行 3 次堆分配 + 3 次 memcpy（quantize A 644 ms/forward）。融合成单 pass NEON（按元素 vadd/vsub/vmul 与标量舍入逐位一致；板上单元测试 12 种尺寸 × 20 组随机输入全部 bit-identical）+ thread_local scratch 指针直通 → 224 ms。
+  2. **符号向量确定性**：原来 `mt19937(张量堆地址)` 做种子，ASLR 导致每次启动旋转矩阵都不同，嵌入跨重启漂移（cos ~0.999）。改为按 K_op 的 FNV 哈希种子。
+  3. **符号向量按 K_op 共享**：原来 per-tensor 各一个 s，q/k/gate/up 旋转后的激活互不相同，A-reuse 失效（每 forward 784 次量化）。共享后复用恢复（560 次，与 W8A8_STANDARD 一致）。
+- 生产切换：`~/services/opi5-switch-accurate.sh [W8A8_HADAMARD|W16A16_STANDARD|W8A8_STANDARD]`（默认第一个）。
+
 ## 7. 内存
 
 - 每个 NPU attention context 约 0.3–0.5 MB（96 个 context：VmRSS +36.5 MB，其中 RssShmem +28.4 MB；不占 CMA）。
@@ -182,6 +203,7 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
   ALiBi、softcap、sinks、非 F16 KV cache 会自动回退到 CPU。
 - `--no-mmap` 需要同时设 `RKNPU_HOST_COMPUTE=0`（见上文）。
 - 开启 `RKNPU_FA` 时，第一个（cold）batch 的结果偶尔有很小的 run-to-run 差异（同一输入 cos 0.99697 vs 0.99709，都 ≥ 0.996）；warm batch 和多 batch 的长时间运行在重复测试中逐字节一致。磁盘 I/O 压力大的时间窗里这个差异更容易出现（曾实测同一天安静时段 6 连跑逐字节一致，重 I/O 时段同二进制两轮之间 min cos 0.9975）；逐层 `RKNPU_FA_CHECK` 始终是 1.000000。
+- **int8 类管线（W8A8 / W8A8_HADAMARD）的跨启动噪声 ~1e-4（cos）**：平台级浮点累加顺序差异（W16A16 也有，~3e-7）被 int8 舍入边界放大。同输入跨进程启动 cos ~0.9999，与 Hadamard 无关。W8A8_HADAMARD 的旋转矩阵本身已确定性（按 K_op 种子），修复前用堆地址做种子时是 ~0.999。
 
 ## 9. 工具
 

@@ -350,8 +350,10 @@ struct ggml_backend_rknpu_buffer_context {
     // Per-block scaling factors for quantized weights
     std::unordered_map<const struct ggml_tensor *, std::vector<float>> quantized_tensor_scales;
 
-    // Per-tensor random sign vector for Hadamard Transform
-    std::unordered_map<const struct ggml_tensor *, std::vector<float>> hadamard_s_vectors;
+    // Per-K_op random sign vector for the Hadamard Transform. Shared across all
+    // weight tensors with the same padded K so activations rotated for q/k/gate/up
+    // (same src1) stay identical and A-quantization results can be reused.
+    std::unordered_map<int, std::vector<float>> hadamard_s_vectors;
 
     std::mutex mutex;
 
@@ -778,16 +780,12 @@ static void rk_job_quant(ggml_backend_rknpu_context * backend_ctx, RkJob & jb) {
     #pragma omp parallel for num_threads(rknpu_ov_threads())
     for (int m = 0; m < Mt; ++m) {
         const float* src_row = x + (size_t)m * row_stride;
-        std::vector<float> ready_row_buf;
         const float* ready_row = src_row + off_k;
         if (is_hadamard) {
-            ready_row_buf.resize(K_seg_op);
-            std::vector<float> signed_row(K);
-            std::vector<float> full_hadamard_row(K_op);
-            for (int k = 0; k < K; ++k) signed_row[k] = src_row[k] * s_vec[k];
-            rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
-            memcpy(ready_row_buf.data(), full_hadamard_row.data() + off_k, K_seg_op * sizeof(float));
-            ready_row = ready_row_buf.data();
+            thread_local static std::vector<float> had_scratch;
+            if ((int)had_scratch.size() < K_op) had_scratch.resize(K_op);
+            rknpu2_calibration::hadamard_signed_fwht(had_scratch.data(), src_row, s_vec, K, K_op);
+            ready_row = had_scratch.data() + off_k;
         }
         if (ta == rknpu2_configuration::NPU_TYPE_FP16) {
             uint16_t* dst_row = (uint16_t*)dst_base + (size_t)m * K_seg_op;
@@ -914,7 +912,7 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
             tensor_virt_addr = it->second.mem->virt_addr;
             b_domain_id = it->second.iommu_domain_id;
             if (is_hadamard) {
-                auto its = src0_buf_ctx->hadamard_s_vectors.find(src0);
+                auto its = src0_buf_ctx->hadamard_s_vectors.find(K_op);
                 GGML_ASSERT(its != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
                 s_vec = its->second.data();
             }
@@ -1709,7 +1707,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
             // Acquiring the Hadamard vector (pointer, no copy; map entries are stable after load)
             if (is_hadamard) {
-                auto its = src0_buf_ctx->hadamard_s_vectors.find(src0);
+                auto its = src0_buf_ctx->hadamard_s_vectors.find(K_op);
                 GGML_ASSERT(its != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
                 s_vec = its->second.data();
             }
@@ -1827,19 +1825,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 #pragma omp parallel for
                 for (int m = 0; m < Mt; ++m) {
                     const float* src_row = x + (size_t)m * row_stride;
-                    std::vector<float> ready_row_buf;
                     const float* ready_row = src_row + k_seg.offset_k;
 
                     // Applying Hadamard Transform
                     if (is_hadamard) {
-                        ready_row_buf.resize(K_seg_op);
-                        std::vector<float> signed_row(K);
-                        std::vector<float> full_hadamard_row(K_op);
-                        for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
-                        rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
-
-                        memcpy(ready_row_buf.data(), full_hadamard_row.data() + k_seg.offset_k, K_seg_op * sizeof(float));
-                        ready_row = ready_row_buf.data();
+                        thread_local static std::vector<float> had_scratch;
+                        if ((int)had_scratch.size() < K_op) had_scratch.resize(K_op);
+                        rknpu2_calibration::hadamard_signed_fwht(had_scratch.data(), src_row, s_vec, K, K_op);
+                        ready_row = had_scratch.data() + k_seg.offset_k;
                     }
 
                     // Handling types and quantizations
@@ -2112,7 +2105,7 @@ static void dequantize_tensor_segment(
     std::vector<float> s_vec;
     if (use_hadamard) {
         std::lock_guard<std::mutex> lock(ctx->mutex);
-        s_vec = ctx->hadamard_s_vectors[tensor];
+        s_vec = ctx->hadamard_s_vectors[K_op];
     }
 
     #pragma omp parallel for
@@ -2268,16 +2261,23 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         // Initializing Hadamard Transform Logic
         if (pipeline->use_hadamard) {
-            std::vector<float> s_vec(K_op, 1.0f);
-            std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor));
-            std::uniform_int_distribution<int> distrib(0, 1);
-
-            for(int k = 0; k < K_op; ++k) {
-                s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
-            }
-
             std::lock_guard<std::mutex> lock(ctx->mutex);
-            ctx->hadamard_s_vectors[tensor] = s_vec;
+            // One sign vector per K_op, shared by every tensor with that padded K. The seed
+            // depends only on K_op: deterministic across launches (an earlier version seeded
+            // from the tensor's heap address, so embeddings changed on every restart), and
+            // identical for q/k/gate/up so their rotated activations — and therefore the
+            // A-quantization cache — can be shared.
+            if (ctx->hadamard_s_vectors.find(K_op) == ctx->hadamard_s_vectors.end()) {
+                std::vector<float> s_vec(K_op, 1.0f);
+                uint64_t h = 1469598103934665603ULL;
+                h ^= (uint64_t)K_op; h *= 1099511628211ULL;
+                std::mt19937 gen((uint32_t)(h ^ (h >> 32)));
+                std::uniform_int_distribution<int> distrib(0, 1);
+                for (int k = 0; k < K_op; ++k) {
+                    s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
+                }
+                ctx->hadamard_s_vectors.emplace(K_op, std::move(s_vec));
+            }
         }
 
         // Computing global scale

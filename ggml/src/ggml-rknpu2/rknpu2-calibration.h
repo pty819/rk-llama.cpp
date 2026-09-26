@@ -28,6 +28,16 @@ namespace rknpu2_calibration {
 void hadamard_transform(float* dst, const float* src, int K, int padded_size);
 
 /**
+ * @brief Fused sign-multiply + zero-pad + FWHT for activation rows (NEON when available).
+ *
+ * Computes out[0..K_op) = FWHT([src[0..K) * s[0..K), 0...0]). Element-wise ops keep the
+ * exact rounding of the scalar reference, so results are bit-identical to
+ * hadamard_transform applied to a pre-signed row. `out` must hold K_op floats and is
+ * expected to be a caller-owned reusable scratch buffer.
+ */
+void hadamard_signed_fwht(float* out, const float* src, const float* s, int K, int K_op);
+
+/**
  * @brief Calculates the next power of two for a given integer.
  * @param n The input integer.
  * @return The smallest power of two that is greater than or equal to n.
