@@ -81,6 +81,10 @@ curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' 
 - **不要加 `--no-mmap`**：默认 `RKNPU_HOST_COMPUTE=1` 时，`--no-mmap` 的加载路径不会调用 `set_tensor`，NPU 的权重打包不会发生，会直接加载失败。
   如果一定要用 `--no-mmap`，请同时设 `RKNPU_HOST_COMPUTE=0`（会恢复旧的拷贝路径，速度更慢）。
   另外：内存紧张时 mmap 的模型页可能被换出，导致个别 forward 卡顿，这是实测到的噪声来源之一。
+- **生产部署（systemd 用户服务，开机自启）**：板上 `~/.config/systemd/user/jina-embed.service`
+  （`loginctl enable-linger liyifan` 已开），参数 `-c 4096 -b 4096 -ub 4096 -np 2 --kv-unified`，
+  管线经 `~/.config/jina-embed.env` 切换（`RKNPU_HYBRID=W8A8_HADAMARD RKNPU_FA=1 RKNPU_FA_MAX_KV=4096`）。
+  `systemctl --user restart jina-embed` 重启；日志在 `~/services/logs/jina-embed.log`。`LimitNOFILE=65536` 由 systemd 下发。
 - 多 NPU 进程 / 省电：参考上游的 `RKNPU_CORES`、`RKNPU_DOMAINS`（见 `ggml/src/ggml-rknpu2/README.md`）。
 
 ## 5. 环境变量
@@ -172,7 +176,11 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
 | W16A16_STANDARD | ≥ 0.990 | 940 tok/s | ~840 MB |
 | **W8A8_HADAMARD（生产默认）** | **≥ 0.9897** | **1089 tok/s** | ~420 MB |
 
-\* 同一温度窗口内 `llama-embedding` 的 perf 数字；绝对值随窗口 ±15–20%，只有同窗口的相对值可比。
+\* 这是 `llama-embedding` CLI 的批处理记账数字（两条 1023-token 文本打包处理的总 token ÷ 总时长，冷+温混合），
+**不是单条长请求的稳态吞吐，偏乐观约 2×**。端到端参考（llama-server HTTP，单并发、~1235 token/条、warm、54–57 °C，
+同夜 IO 压力窗口内）：单并发 **~430–480 tok/s**；纯前向（CLI 单条 ~1235 token，FA 墙钟 + matmul）约 575–810 tok/s。
+绝对值受温度窗口（±15–20%）和板上后台 IO（hermes 等，IO 压力可再压 20%+）影响，只有同窗口相对值可比。
+并发：长文本双 slot 聚合吞吐反而 −25%（单请求已把 CPU+NPU 流水线吃满）；~250 token 短文本双 slot +0–10%。
 
 - **W8A8 的精度问题在激活不在权重**：per-row 单 scale 的 int8 激活量化 × 28 层 × last-token pooling，对短输入/多语种敏感。
 - **字面意义的 W8A16 在本平台不存在**：板上探针遍历 `rknn_matmul_type` 1–15，混合精度的 5（FP16×INT8→FP32）、6（FP16×INT8→FP16）、7、8、11、12 全部返回 `-5 unsupported matmul dtype`；支持的只有 1/2/4（纯 fp16）、2/3/9（纯 int8）、10（纯 int4）。fp16 权重的 2× 字节流量也使 W16A16 的 `matmul_run` 固定为 int8 的 ~1.78×（914 vs 514 ms/forward，NPU 带宽决定，CPU 侧不可回收）。
