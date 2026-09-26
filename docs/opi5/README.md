@@ -172,6 +172,7 @@ cosine 是和原始 CPU Q8_0 build 的输出比较（对照输入：10 条短文
 
 ## 8. 已知限制
 
+- **Q4_K_M 别用在这条分支上（当前是负优化）**：Q4_K 会被路由到 NPU 的 `W4A4_HADAMARD`（INT4×INT4→INT16）路径，但该路径在 librknnrt 2.3.2 上有两个独立的坑：INT4 matmul context 创建约 31.7 ms/个（fp16 路径的 48 倍，每 forward 588 个，占 matmul 总时间 65%），单次 run 平均 11.3 ms（fp16 路径的 15.6 倍）。实测 jina-v5 Q4_K_M @1023 token 只有 90–160 tok/s，比纯 CPU 跑 Q4（155–210 tok/s）还慢，远低于 Q8+NPU（450–610 tok/s）。本分支请用 Q8_0；想让 Q4 留在 CPU 需要清空 `default_patterns[GGML_TYPE_Q4_K]`（目前没有现成环境变量）。
 - **首个 batch 的 context 创建开销**：每次出现新的 key 长度时要创建 context，547 / 1023 / 1975 token 分别约 36 / 52 / 141 ms。177 token 这种单次短 batch 开 FA 反而稍慢。
 - **CPU softmax 不是流水线瓶颈，别再从这里挤速度**：profiler 细分显示 softmax 计算占该段 89%，但逐行范围裁剪的优化（值逐位一致）实测 e2e 持平或更慢——每核 2 个提交线程时，一个线程的 CPU softmax 正好覆盖另一个线程的 NPU matmul，流水线是 NPU 吞吐瓶颈。想再快只能把 softmax（或整个 FA）搬到 NPU 上融合。
 - **需要 3 行 `llama-context` 补丁**：没有它时，`flash_attn = auto` 遇到 RKNPU 上的 FA 节点会把 flash attention 整体关掉（CPU FA 也一起关，变得更慢）。
