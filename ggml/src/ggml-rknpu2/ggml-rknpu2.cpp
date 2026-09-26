@@ -1086,7 +1086,8 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
 // ---------------------------------------------------------------------------------------------------------------
 // npufa (2026-09-26): FLASH_ATTN_EXT on the NPU (RKNPU_FA=1; default off = previous behaviour).
 // Non-fused: per (query tile of RKNPU_FA_MT rows, KV head): S = Q.K^T on the NPU (fp16 x fp16 -> fp32; the GQA Q heads
-// sharing the KV head are stacked in M; B = K rows as TP_NORM), exact mask + scale + softmax on the CPU (fp32, P written as
+// sharing the KV head are stacked in M; B = K in the NPU native layout by default — see rknpu_fa_native_b; legacy
+// fallback binds K rows as TP_NORM), exact mask + scale + softmax on the CPU (fp32, P written as
 // unnormalized fp16 straight into the PV A buffer), O = P.V on the NPU (B = V rows, normal layout), O *= 1/rowsum.
 // A/C use the NPU native layouts (normal layouts make rknn_matmul_run convert on the CPU). The key range per tile is
 // taken from the actual ggml mask tensor (per-row first/last unmasked key; rows whose in-range mask is not all-zero take an
@@ -1116,6 +1117,87 @@ static size_t g_max_ctx = 192;
 static std::vector<Mem> kbuf, vbuf;
 static std::vector<TB> tbs;
 static std::vector<int> row_lo, row_hi; static std::vector<uint8_t> row_clean;
+
+// Native-B mode (RKNPU_FA_NATIVE_B=1, default): the QK/PV matmul contexts take B already in the NPU native layout
+// (RK3588 fp16: (N/16, K/32, 16, 32)), so set_io_mem stops converting B on the CPU (4.9 us vs 186 us per bind,
+// measured). Native B is read at run time (verified on-device: new data behind an unchanged binding is picked up),
+// so B is bound once per buffer and per-layer refreshes only need the gather + mem_sync. QK's native K layout is
+// N-prefix compatible (one shared buffer per KV head; shorter Nq binds the same prefix), but PV's native V layout is
+// not (its stride depends on Nq), so each PV job interleaves its own window into the per-thread staging buffer.
+static bool rknpu_fa_native_b() {
+    static const bool ok = [](){
+        const char * e = std::getenv("RKNPU_FA_NATIVE_B");
+        if (e && std::atoi(e) == 0) return false;
+        rknn_matmul_ctx c; rknn_matmul_info info; rknn_matmul_io_attr io;
+        memset(&info, 0, sizeof(info)); memset(&io, 0, sizeof(io));
+        info.M = 64; info.K = 128; info.N = 256; info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+        info.B_layout = RKNN_MM_LAYOUT_NATIVE; info.AC_layout = RKNN_MM_LAYOUT_NATIVE;
+        const int ret = rknn_matmul_create(&c, &info, &io);
+        if (ret < 0) return false;
+        const bool good = io.B.n_dims == 4 && io.B.dims[0] == 16 && io.B.dims[1] == 4 && io.B.dims[2] == 16 && io.B.dims[3] == 32;
+        rknn_matmul_destroy(c);
+        return good;
+    }();
+    return ok;
+}
+// K rows [j][d] -> QK native B (nkv/16, D/32, 16, 32): per key one D*2-byte row becomes D/32 chunks of 64 B.
+// Byte-identical to the runtime's own conversion (verified against rknn_B_normal_layout_to_native_layout).
+static void knat_fill(const ggml_tensor * k, int g, int nkv, int D, __fp16 * out) {
+    for (int j = 0; j < nkv; j++) {
+        const __fp16 * src = (const __fp16 *)((const char *)k->data + (size_t)j * k->nb[1] + (size_t)g * k->nb[2]);
+        __fp16 * dst = out + (size_t)(j / 16) * (D / 32) * 512 + (size_t)(j % 16) * 32;
+        for (int db = 0; db < D / 32; db++)
+            for (int c = 0; c < 32; c += 8)
+                vst1q_f16(dst + (size_t)db * 512 + c, vld1q_f16(src + (size_t)db * 32 + c));
+    }
+}
+static inline void trn8x8_f16(const __fp16 * const in[8], __fp16 * const out[8]) {
+    uint16x8_t x0 = vld1q_u16((const uint16_t *)in[0]), x1 = vld1q_u16((const uint16_t *)in[1]);
+    uint16x8_t x2 = vld1q_u16((const uint16_t *)in[2]), x3 = vld1q_u16((const uint16_t *)in[3]);
+    uint16x8_t x4 = vld1q_u16((const uint16_t *)in[4]), x5 = vld1q_u16((const uint16_t *)in[5]);
+    uint16x8_t x6 = vld1q_u16((const uint16_t *)in[6]), x7 = vld1q_u16((const uint16_t *)in[7]);
+    uint16x8x2_t t01 = vtrnq_u16(x0, x1), t23 = vtrnq_u16(x2, x3), t45 = vtrnq_u16(x4, x5), t67 = vtrnq_u16(x6, x7);
+    uint32x4x2_t u0 = vtrnq_u32(vreinterpretq_u32_u16(t01.val[0]), vreinterpretq_u32_u16(t23.val[0]));
+    uint32x4x2_t u1 = vtrnq_u32(vreinterpretq_u32_u16(t01.val[1]), vreinterpretq_u32_u16(t23.val[1]));
+    uint32x4x2_t u2 = vtrnq_u32(vreinterpretq_u32_u16(t45.val[0]), vreinterpretq_u32_u16(t67.val[0]));
+    uint32x4x2_t u3 = vtrnq_u32(vreinterpretq_u32_u16(t45.val[1]), vreinterpretq_u32_u16(t67.val[1]));
+    uint64x2_t v0lo = vtrn1q_u64(vreinterpretq_u64_u32(u0.val[0]), vreinterpretq_u64_u32(u2.val[0]));
+    uint64x2_t v0hi = vtrn2q_u64(vreinterpretq_u64_u32(u0.val[0]), vreinterpretq_u64_u32(u2.val[0]));
+    uint64x2_t v1lo = vtrn1q_u64(vreinterpretq_u64_u32(u1.val[0]), vreinterpretq_u64_u32(u3.val[0]));
+    uint64x2_t v1hi = vtrn2q_u64(vreinterpretq_u64_u32(u1.val[0]), vreinterpretq_u64_u32(u3.val[0]));
+    uint64x2_t v2lo = vtrn1q_u64(vreinterpretq_u64_u32(u0.val[1]), vreinterpretq_u64_u32(u2.val[1]));
+    uint64x2_t v2hi = vtrn2q_u64(vreinterpretq_u64_u32(u0.val[1]), vreinterpretq_u64_u32(u2.val[1]));
+    uint64x2_t v3lo = vtrn1q_u64(vreinterpretq_u64_u32(u1.val[1]), vreinterpretq_u64_u32(u3.val[1]));
+    uint64x2_t v3hi = vtrn2q_u64(vreinterpretq_u64_u32(u1.val[1]), vreinterpretq_u64_u32(u3.val[1]));
+    vst1q_u16((uint16_t *)out[0], vreinterpretq_u16_u64(v0lo));
+    vst1q_u16((uint16_t *)out[1], vreinterpretq_u16_u64(v1lo));
+    vst1q_u16((uint16_t *)out[2], vreinterpretq_u16_u64(v2lo));
+    vst1q_u16((uint16_t *)out[3], vreinterpretq_u16_u64(v3lo));
+    vst1q_u16((uint16_t *)out[4], vreinterpretq_u16_u64(v0hi));
+    vst1q_u16((uint16_t *)out[5], vreinterpretq_u16_u64(v1hi));
+    vst1q_u16((uint16_t *)out[6], vreinterpretq_u16_u64(v2hi));
+    vst1q_u16((uint16_t *)out[7], vreinterpretq_u16_u64(v3hi));
+}
+// V rows [j][d] (window [k0, k0+Nq) of one KV head) -> PV native B (D/16, Nq/32, 16, 32) via 8x8 transposes;
+// Nq and D are multiples of 32 (tile + head-dim constraints). Same byte layout as the runtime's conversion.
+static void vnat_fill(const ggml_tensor * v, int g, int k0, int Nq, int D, __fp16 * out) {
+    const int nk32 = Nq / 32;
+    const __fp16 * base = (const __fp16 *)((const char *)v->data + (size_t)g * v->nb[2]);
+    for (int j8 = 0; j8 + 8 <= Nq; j8 += 8)
+        for (int d8 = 0; d8 + 8 <= D; d8 += 8) {
+            const __fp16 * in[8]; __fp16 * o[8];
+            for (int r = 0; r < 8; r++) in[r] = (const __fp16 *)((const char *)base + (size_t)(k0 + j8 + r) * v->nb[1]) + d8;
+            for (int r = 0; r < 8; r++) {
+                const int d = d8 + r;
+                o[r] = out + (size_t)(d / 16) * nk32 * 512 + (size_t)(j8 / 32) * 512 + (size_t)(d % 16) * 32 + (j8 % 32);
+            }
+            trn8x8_f16(in, o);
+        }
+    for (int j = Nq - Nq % 8; j < Nq; j++)   // unreachable with tile-aligned Nq; kept for safety
+        for (int d = 0; d < D; d++)
+            out[(size_t)(d / 16) * nk32 * 512 + (size_t)(j / 32) * 512 + (size_t)(d % 16) * 32 + (j % 32)] =
+                *(const __fp16 *)((const char *)base + (size_t)(k0 + j) * v->nb[1] + (size_t)d * 2);
+}
 
 // Contexts of a slot are only used by that slot's driver thread, so a thread may evict its own LRU contexts inside a
 // call (except `keep`, the context it currently holds, and anyctx which owns the buffers). Hard cap = max(RKNPU_FA_MAX_CTX,
@@ -1163,11 +1245,16 @@ static bool ensure(Mem & mm, size_t size) {   // call only while no driver threa
     clear_binds();
     return true;
 }
-static inline bool bind(Ctx * c, rknn_tensor_mem * a, rknn_tensor_mem * b, rknn_tensor_mem * cc) {
+static inline bool bind(Ctx * c, rknn_tensor_mem * a, rknn_tensor_mem * b, rknn_tensor_mem * cc, bool native_b = false) {
     if (c->bA != a) { if (rknn_matmul_set_io_mem(c->ctx, a, &c->io.A) < 0) return false; c->bA = a; }
-    // B is always re-bound: for non-native B layouts the runtime converts/caches B at set_io_mem time, so new K/V data
-    // behind the same buffer is not picked up otherwise (stale K/V from the previous layer).
-    if (rknn_matmul_set_io_mem(c->ctx, b, &c->io.B) < 0) return false; c->bB = b;
+    if (native_b) {
+        // native B is read at run time: the binding only tracks the buffer, data refresh + mem_sync is enough
+        if (c->bB != b) { if (rknn_matmul_set_io_mem(c->ctx, b, &c->io.B) < 0) return false; c->bB = b; }
+    } else if (rknn_matmul_set_io_mem(c->ctx, b, &c->io.B) < 0) {
+        // legacy: B is always re-bound: for non-native B layouts the runtime converts/caches B at set_io_mem time,
+        // so new K/V data behind the same buffer is not picked up otherwise (stale K/V from the previous layer).
+        return false;
+    } else c->bB = b;
     if (c->bC != cc) { if (rknn_matmul_set_io_mem(c->ctx, cc, &c->io.C) < 0) return false; c->bC = cc; }
     return true;
 }
@@ -1284,7 +1371,8 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     if (jobs.empty()) return GGML_STATUS_SUCCESS;
 
     // ---- 3. buffers ----
-    if (!anyctx && !get_ctx(ratio * jobs[0].mtp, D, jobs[0].Nq, 2, 0)) return GGML_STATUS_FAILED;
+    const bool nat = rknpu_fa_native_b();
+    if (!anyctx && !get_ctx(ratio * jobs[0].mtp, D, jobs[0].Nq, nat ? 1 : 2, 0)) return GGML_STATUS_FAILED;
     if ((int)kbuf.size() < Hkv) { kbuf.resize(Hkv); vbuf.resize(Hkv); }
     if ((int)tbs.size() < nthr) tbs.resize(nthr);
     const size_t Mmax = (size_t)ratio * mt;
@@ -1292,18 +1380,24 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     for (int t = 0; t < nthr; t++) {
         TB & b = tbs[t];
         if (!ensure(b.q, Mmax * D * 2) || !ensure(b.s, Mmax * kvcap * 4) || !ensure(b.p, Mmax * kvcap * 2) || !ensure(b.o, Mmax * D * 4)) return GGML_STATUS_FAILED;
-        if (kskip && (!ensure(b.ks, (size_t)kvcap * D * 2) || !ensure(b.vs, (size_t)kvcap * D * 2))) return GGML_STATUS_FAILED;
+        if ((kskip || nat) && (!ensure(b.ks, (size_t)kvcap * D * 2) || !ensure(b.vs, (size_t)kvcap * D * 2))) return GGML_STATUS_FAILED;
         b.inv.resize(Mmax); b.mx4.resize(Mmax); b.sm4.resize(Mmax);
     }
-    // ---- 4. gather per-KV-head K/V rows from the (strided) F16 cache ----
-    #pragma omp parallel for schedule(static)
-    for (int x = 0; x < 2 * Hkv; x++) {
-        const int g = x >> 1; const ggml_tensor * src = (x & 1) ? v : k;
-        __fp16 * d = (__fp16 *)((x & 1) ? vbuf[g].m->virt_addr : kbuf[g].m->virt_addr);
-        for (int j = 0; j < nkv; j++) memcpy(d + (size_t)j * D, (const char *)src->data + (size_t)j * src->nb[1] + (size_t)g * src->nb[2], (size_t)D * 2);
-    }
-    for (int g = 0; g < Hkv; g++) {
-        if (rknn_mem_sync(anyctx->ctx, kbuf[g].m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0 || rknn_mem_sync(anyctx->ctx, vbuf[g].m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) return GGML_STATUS_FAILED;
+    // ---- 4. gather per-KV-head K/V from the (strided) F16 cache: native K layout, or legacy plain rows ----
+    if (nat) {
+        #pragma omp parallel for schedule(static)
+        for (int g = 0; g < Hkv; g++) knat_fill(k, g, nkv, D, (__fp16 *)kbuf[g].m->virt_addr);
+        for (int g = 0; g < Hkv; g++) if (rknn_mem_sync(anyctx->ctx, kbuf[g].m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) return GGML_STATUS_FAILED;
+    } else {
+        #pragma omp parallel for schedule(static)
+        for (int x = 0; x < 2 * Hkv; x++) {
+            const int g = x >> 1; const ggml_tensor * src = (x & 1) ? v : k;
+            __fp16 * d = (__fp16 *)((x & 1) ? vbuf[g].m->virt_addr : kbuf[g].m->virt_addr);
+            for (int j = 0; j < nkv; j++) memcpy(d + (size_t)j * D, (const char *)src->data + (size_t)j * src->nb[1] + (size_t)g * src->nb[2], (size_t)D * 2);
+        }
+        for (int g = 0; g < Hkv; g++) {
+            if (rknn_mem_sync(anyctx->ctx, kbuf[g].m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0 || rknn_mem_sync(anyctx->ctx, vbuf[g].m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) return GGML_STATUS_FAILED;
+        }
     }
     const double T2 = rknpu_prof::now_ms();
 
@@ -1321,8 +1415,8 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             if (ji >= (int)jobs.size() || failed.load(std::memory_order_relaxed)) break;
             const Job & jb = jobs[ji];
             const int M = ratio * jb.mtp, Nq = jb.Nq;
-            Ctx * cq = get_ctx(M, D, Nq, 2, tid);
-            Ctx * cv = get_ctx(M, Nq, D, 0, tid, cq);
+            Ctx * cq = get_ctx(M, D, Nq, nat ? 1 : 2, tid);
+            Ctx * cv = get_ctx(M, Nq, D, nat ? 1 : 0, tid, cq);
             if (!cq || !cv) { failed = true; break; }
             double t0 = prof ? rknpu_prof::now_ms() : 0;
             // Q -> native A (D/8, M, 8) fp16; padded rows zero
@@ -1336,18 +1430,29 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             }
             if (rknn_mem_sync(cq->ctx, b.q.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
             double t1 = prof ? rknpu_prof::now_ms() : 0;
-            // K/V from key k0: jobs with k0 > 0 copy rows [k0, k0+Nq) into this thread's staging buffers. (Binding
+            // K/V from key k0: jobs with k0 > 0 copy their window into this thread's staging buffers. (Binding
             // create_mem_from_fd views of the shared K/V buffer at an offset gives wrong results when the two driver threads
             // of one NPU core use different offsets of the same fd concurrently.)
             const int k0 = jb.k0;   // S/P column j <-> key k0 + j
             rknn_tensor_mem * kb = kbuf[jb.g].m, * vb = vbuf[jb.g].m;
-            if (k0 > 0) {
+            if (nat) {
+                if (k0 > 0) {   // K native layout is N-prefix compatible: stage whole (Nq/16) key blocks
+                    const size_t blk = (size_t)(D / 32) * 512 * 2;
+                    memcpy(b.ks.m->virt_addr, (const char *)kb->virt_addr + (size_t)(k0 / 16) * blk, (size_t)(Nq / 16) * blk);
+                    if (rknn_mem_sync(cq->ctx, b.ks.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
+                    kb = b.ks.m;
+                }
+                // PV's native layout depends on Nq, so every PV job interleaves its own V window
+                vnat_fill(v, jb.g, k0, Nq, D, (__fp16 *)b.vs.m->virt_addr);
+                if (rknn_mem_sync(cv->ctx, b.vs.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
+                vb = b.vs.m;
+            } else if (k0 > 0) {
                 memcpy(b.ks.m->virt_addr, (const char *)kb->virt_addr + (size_t)k0 * D * 2, (size_t)Nq * D * 2);
                 memcpy(b.vs.m->virt_addr, (const char *)vb->virt_addr + (size_t)k0 * D * 2, (size_t)Nq * D * 2);
                 if (rknn_mem_sync(cq->ctx, b.ks.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0 || rknn_mem_sync(cq->ctx, b.vs.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
                 kb = b.ks.m; vb = b.vs.m;
             }
-            if (!bind(cq, b.q.m, kb, b.s.m) || !bind(cv, b.p.m, vb, b.o.m)) { failed = true; break; }
+            if (!bind(cq, b.q.m, kb, b.s.m, nat) || !bind(cv, b.p.m, vb, b.o.m, nat)) { failed = true; break; }
             double t2 = prof ? rknpu_prof::now_ms() : 0;
             if (rknn_matmul_run(cq->ctx) < 0) { failed = true; break; }
             double t3 = prof ? rknpu_prof::now_ms() : 0;
