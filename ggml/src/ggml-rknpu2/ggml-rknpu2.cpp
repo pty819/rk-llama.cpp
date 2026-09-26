@@ -767,6 +767,69 @@ static inline bool rk_tensor_overlap(const ggml_tensor * a, const ggml_tensor * 
     return a0 < b1 && b0 < a1;
 }
 
+// NEON C-matrix epilogue: dst = src * (sa*wscale), optionally accumulated.
+// Bit-identical to the scalar loops it replaces: int->float conversion is exact
+// for |x| < 2^24 (per-segment int8 dot products stay far below), the combined
+// scale sa*wscale[i] is rounded once before the product, and accumulation uses
+// explicit vmulq/vaddq — never fmla, which fuses into a single rounding on A76.
+static inline void rknpu_epi_f32(float * dst, const float * src, int n, float sa, const float * wscale, bool accum) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    int i = 0;
+    if (wscale) {
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t w = vmulq_f32(vld1q_f32(wscale + i), vdupq_n_f32(sa));
+            float32x4_t p = vmulq_f32(vld1q_f32(src + i), w);
+            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
+            vst1q_f32(dst + i, p);
+        }
+    } else {
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t p = vmulq_f32(vld1q_f32(src + i), vdupq_n_f32(sa));
+            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
+            vst1q_f32(dst + i, p);
+        }
+    }
+    for (; i < n; ++i) {
+        float p = src[i] * (wscale ? wscale[i] * sa : sa);
+        dst[i] = accum ? dst[i] + p : p;
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        float p = src[i] * (wscale ? wscale[i] * sa : sa);
+        dst[i] = accum ? dst[i] + p : p;
+    }
+#endif
+}
+
+static inline void rknpu_epi_i32(float * dst, const int32_t * src, int n, float sa, const float * wscale, bool accum) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    int i = 0;
+    if (wscale) {
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t w = vmulq_f32(vld1q_f32(wscale + i), vdupq_n_f32(sa));
+            float32x4_t p = vmulq_f32(vcvtq_f32_s32(vld1q_s32(src + i)), w);
+            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
+            vst1q_f32(dst + i, p);
+        }
+    } else {
+        for (; i + 4 <= n; i += 4) {
+            float32x4_t p = vmulq_f32(vcvtq_f32_s32(vld1q_s32(src + i)), vdupq_n_f32(sa));
+            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
+            vst1q_f32(dst + i, p);
+        }
+    }
+    for (; i < n; ++i) {
+        float p = (float)src[i] * (wscale ? wscale[i] * sa : sa);
+        dst[i] = accum ? dst[i] + p : p;
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        float p = (float)src[i] * (wscale ? wscale[i] * sa : sa);
+        dst[i] = accum ? dst[i] + p : p;
+    }
+#endif
+}
+
 static void rk_job_quant(ggml_backend_rknpu_context * backend_ctx, RkJob & jb) {
     UNUSED(backend_ctx);
     if (!jb.need_quant) return;
@@ -833,17 +896,10 @@ static void rk_job_dequant(RkJob & jb) {
             float* dst_ptr = dst_tile + (size_t)m * N + N_offset;
             if (npu_type_c == rknpu2_configuration::NPU_TYPE_FP32) {
                 const float* src_ptr = (const float*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
-                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
-                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+                rknpu_epi_f32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
             } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT32) {
                 const int32_t* src_ptr = (const int32_t*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
-                if (wscale) {
-                    if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * wscale[n]); }
-                    else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * (sa * wscale[n]); }
-                } else {
-                    if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * sa; }
-                    else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * sa; }
-                }
+                rknpu_epi_i32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
             } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT16) {
                 const int16_t* src_ptr = (const int16_t*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
                 if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
@@ -1947,17 +2003,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         float* dst_ptr = dst_tile + (size_t)m * N + N_offset;
                         if (npu_type_c == rknpu2_configuration::NPU_TYPE_FP32) {
                             const float* src_ptr = (const float*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-                            if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
-                            else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+                            rknpu_epi_f32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
                         } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT32) {
                             const int32_t* src_ptr = (const int32_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-                            if (wscale) {
-                                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * wscale[n]); }
-                                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * (sa * wscale[n]); }
-                            } else {
-                                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * sa; }
-                                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * sa; }
-                            }
+                            rknpu_epi_i32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
                         } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT16) {
                             const int16_t* src_ptr = (const int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
                             if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
