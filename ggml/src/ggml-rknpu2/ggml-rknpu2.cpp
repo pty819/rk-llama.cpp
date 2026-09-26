@@ -1106,7 +1106,7 @@ namespace rkfa {
 static inline int rup(int x, int a) { return (x + a - 1) / a * a; }
 struct Ctx { rknn_matmul_ctx ctx = 0; rknn_matmul_info info; rknn_matmul_io_attr io; rknn_tensor_mem *bA = nullptr, *bB = nullptr, *bC = nullptr; uint64_t last = 0; };
 struct Mem { rknn_tensor_mem * m = nullptr; size_t size = 0; rknn_matmul_ctx owner = 0; };
-struct TB { Mem q, s, p, o; std::vector<float> inv; std::vector<float32x4_t> mx4, sm4; };
+struct TB { Mem q, s, p, o, ks, vs; std::vector<float> inv; std::vector<float32x4_t> mx4, sm4; };   // ks/vs: K/V rows [k0, k0+Nq) staged for jobs with k0 > 0
 static std::mutex mu;
 static std::map<std::tuple<int,int,int,int,int>, Ctx*> ctxs;   // (M, K, N, B layout, slot)
 static Ctx * anyctx = nullptr;
@@ -1191,14 +1191,15 @@ inline static float32x4_t v_expf(float32x4_t x) {   // same as ggml_v_expf
                      vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)));
 }
 enum { F_MASK, F_GATHER, F_QFILL, F_BIND, F_RUNQK, F_SOFTMAX, F_RUNPV, F_OUT, F_N };
-static double ft[F_N]; static long f_n = 0; static double f_wall = 0;
+static double ft[F_N]; static long f_n = 0; static double f_wall = 0; static double f_cols = 0, f_cols_noskip = 0;
 static const char * fname[F_N] = {"mask scan (wall)", "K/V gather+sync (wall)", "Q fill+sync (thr)", "bind (thr)", "run QK (thr)",
                                   "softmax+syncs (thr)", "run PV (thr)", "O sync+scale (thr)"};
 static void dump_prof() {
     if (f_n == 0) return;
     fprintf(stderr, "[RKNPU_PROFILE] NPU FA: nodes=%ld wall=%.2f ms (%.3f ms/node) contexts live=%zu created=%ld evicted=%ld (create %.1f ms total)\n", f_n, f_wall, f_wall / f_n, ctxs.size(), n_create, n_evict, create_ms);
     for (int i = 0; i < F_N; i++) fprintf(stderr, "[RKNPU_PROFILE]   FA %-26s %9.2f ms\n", fname[i], ft[i]);
-    memset(ft, 0, sizeof(ft)); f_n = 0; f_wall = 0;
+    fprintf(stderr, "[RKNPU_PROFILE]   FA key columns computed %.3g (without key-start skip %.3g, %.1f%%)\n", f_cols, f_cols_noskip, f_cols_noskip > 0 ? 100.0 * f_cols / f_cols_noskip : 0.0);
+    memset(ft, 0, sizeof(ft)); f_n = 0; f_wall = 0; f_cols = f_cols_noskip = 0;
 }
 } // namespace rkfa
 
@@ -1259,19 +1260,25 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     const double T1 = rknpu_prof::now_ms();
 
     // ---- 2. jobs: (tile, kv head); tile key range from the mask, bucketed ----
-    struct Job { int r0, mtc, mtp, g, Nq; };
+    // key range [k0, k0+Nq): k0 = first unmasked key of the tile rounded down to the tile size (bundled multi-sequence
+    // batches: keys of earlier sequences are skipped), Nq a multiple of the tile size -> contexts stay a subset of the
+    // max-length set. K/V are bound at offset k0 through buffer views.
+    static const bool kskip = [](){ const char * e = std::getenv("RKNPU_FA_KSKIP"); return !e || std::atoi(e) != 0; }();
+    struct Job { int r0, mtc, mtp, g, Nq, k0; };
     std::vector<Job> jobs;
     for (int r0 = 0; r0 < n; r0 += mt) {
         const int mtc = std::min(mt, n - r0);
-        int kend = 0;
-        for (int i = 0; i < mtc; i++) kend = std::max(kend, row_hi[r0 + i] + 1);
+        int kend = 0, kbeg = INT_MAX;
+        for (int i = 0; i < mtc; i++) if (row_hi[r0 + i] >= row_lo[r0 + i]) { kend = std::max(kend, row_hi[r0 + i] + 1); kbeg = std::min(kbeg, row_lo[r0 + i]); }
         if (kend <= 0) {   // fully masked tile: zeros
             for (int i = 0; i < mtc; i++) for (int h = 0; h < H; h++)
                 memset((char *)dst->data + (size_t)(r0 + i) * dst->nb[2] + (size_t)h * dst->nb[1], 0, (size_t)D * sizeof(float));
             continue;
         }
-        const int Nq = std::min(rup(kend, NB), kvcap);
-        for (int g = 0; g < Hkv; g++) jobs.push_back({r0, mtc, mt, g, Nq});   // partial tile zero-padded to a full tile (fixed M)
+        const int k1 = std::min(rup(kend, NB), kvcap);
+        const int k0 = kskip ? kbeg / NB * NB : 0;
+        if (prof) { f_cols += (double)Hkv * (k1 - k0); f_cols_noskip += (double)Hkv * k1; }
+        for (int g = 0; g < Hkv; g++) jobs.push_back({r0, mtc, mt, g, k1 - k0, k0});   // partial tile zero-padded to a full tile (fixed M)
     }
     std::stable_sort(jobs.begin(), jobs.end(), [](const Job & a, const Job & b){ return (long)a.Nq * a.mtp > (long)b.Nq * b.mtp; });
     if (jobs.empty()) return GGML_STATUS_SUCCESS;
@@ -1285,6 +1292,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     for (int t = 0; t < nthr; t++) {
         TB & b = tbs[t];
         if (!ensure(b.q, Mmax * D * 2) || !ensure(b.s, Mmax * kvcap * 4) || !ensure(b.p, Mmax * kvcap * 2) || !ensure(b.o, Mmax * D * 4)) return GGML_STATUS_FAILED;
+        if (kskip && (!ensure(b.ks, (size_t)kvcap * D * 2) || !ensure(b.vs, (size_t)kvcap * D * 2))) return GGML_STATUS_FAILED;
         b.inv.resize(Mmax); b.mx4.resize(Mmax); b.sm4.resize(Mmax);
     }
     // ---- 4. gather per-KV-head K/V rows from the (strided) F16 cache ----
@@ -1328,7 +1336,18 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             }
             if (rknn_mem_sync(cq->ctx, b.q.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
             double t1 = prof ? rknpu_prof::now_ms() : 0;
-            if (!bind(cq, b.q.m, kbuf[jb.g].m, b.s.m) || !bind(cv, b.p.m, vbuf[jb.g].m, b.o.m)) { failed = true; break; }
+            // K/V from key k0: jobs with k0 > 0 copy rows [k0, k0+Nq) into this thread's staging buffers. (Binding
+            // create_mem_from_fd views of the shared K/V buffer at an offset gives wrong results when the two driver threads
+            // of one NPU core use different offsets of the same fd concurrently.)
+            const int k0 = jb.k0;   // S/P column j <-> key k0 + j
+            rknn_tensor_mem * kb = kbuf[jb.g].m, * vb = vbuf[jb.g].m;
+            if (k0 > 0) {
+                memcpy(b.ks.m->virt_addr, (const char *)kb->virt_addr + (size_t)k0 * D * 2, (size_t)Nq * D * 2);
+                memcpy(b.vs.m->virt_addr, (const char *)vb->virt_addr + (size_t)k0 * D * 2, (size_t)Nq * D * 2);
+                if (rknn_mem_sync(cq->ctx, b.ks.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0 || rknn_mem_sync(cq->ctx, b.vs.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
+                kb = b.ks.m; vb = b.vs.m;
+            }
+            if (!bind(cq, b.q.m, kb, b.s.m) || !bind(cv, b.p.m, vb, b.o.m)) { failed = true; break; }
             double t2 = prof ? rknpu_prof::now_ms() : 0;
             if (rknn_matmul_run(cq->ctx) < 0) { failed = true; break; }
             double t3 = prof ? rknpu_prof::now_ms() : 0;
@@ -1342,7 +1361,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 const float * Sb = S + (size_t)n4 * M * 4;
                 for (int r = 0; r < M; r++) {
                     int t; if (!row_tok(r, t) || !row_clean[t]) continue;
-                    const int lo = row_lo[t], hi = row_hi[t];
+                    const int lo = row_lo[t] - k0, hi = row_hi[t] - k0;
                     if (j0 > hi || j0 + 3 < lo) continue;
                     float32x4_t x = vld1q_f32(Sb + (size_t)r * 4);
                     if (j0 < lo || j0 + 3 > hi) {
@@ -1359,8 +1378,8 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 __fp16 * Pb = P + (size_t)n8 * M * 8;
                 for (int r = 0; r < M; r++) {
                     int t; const bool valid = row_tok(r, t);
-                    if (!valid || !row_clean[t] || j0 > row_hi[t] || j0 + 7 < row_lo[t]) { vst1q_f16(Pb + (size_t)r * 8, vdupq_n_f16(0)); continue; }
-                    const int lo = row_lo[t], hi = row_hi[t];
+                    if (!valid || !row_clean[t] || j0 > row_hi[t] - k0 || j0 + 7 < row_lo[t] - k0) { vst1q_f16(Pb + (size_t)r * 8, vdupq_n_f16(0)); continue; }
+                    const int lo = row_lo[t] - k0, hi = row_hi[t] - k0;
                     float32x4_t e0 = v_expf(vfmaq_f32(b.mx4[r], vld1q_f32(Sb0 + (size_t)r * 4), vs));
                     float32x4_t e1 = v_expf(vfmaq_f32(b.mx4[r], vld1q_f32(Sb1 + (size_t)r * 4), vs));
                     if (j0 < lo || j0 + 7 > hi) {
@@ -1380,8 +1399,9 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 const uint16_t * mr = (const uint16_t *)((const char *)mask->data + (size_t)t * mask->nb[1]);
                 const __fp16 * mh = (const __fp16 *)mr;
                 auto logit = [&](int j) -> float {
-                    if (j >= nkv || mr[j] == 0xFC00) return -INFINITY;
-                    return S[((size_t)(j / 4) * M + r) * 4 + (j & 3)] * scale + (float)mh[j];
+                    const int kj = k0 + j;
+                    if (kj >= nkv || mr[kj] == 0xFC00) return -INFINITY;
+                    return S[((size_t)(j / 4) * M + r) * 4 + (j & 3)] * scale + (float)mh[kj];
                 };
                 float mx = -INFINITY;
                 for (int j = 0; j < Nq; j++) mx = std::max(mx, logit(j));
