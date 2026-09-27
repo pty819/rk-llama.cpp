@@ -403,6 +403,7 @@ struct rknpu_matmul_context {
 
     bool b_bound = false;
     std::shared_ptr<rknn_tensor_mem> mem_B;
+    uint64_t last_used = 0;   // LRU tick for cache eviction
 
     rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type, int32_t domain_id) {
         memset(&info, 0, sizeof(info));
@@ -434,6 +435,17 @@ struct ggml_backend_rknpu_context {
 
     // RKNN matmul contexts cache (tensor_fd, offset, M, K, N, core_id, type, domain_id)
     std::unordered_map<std::tuple<uintptr_t, size_t, int, int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
+    uint64_t mctx_tick = 0;
+    // Cache is keyed by M_op = next_pow2(n_tokens): every distinct token-count
+    // bucket mints a full family (~588 ctxs) that was never evicted, pinning
+    // ~2 4KB DMA-BUF fds per ctx inside librknnrt forever -> fd table + CMA
+    // exhaustion on long-running servers. Bound it with LRU eviction; live
+    // graphs keep their shared_ptr refs, eviction only drops the cache's ref.
+    static size_t mctx_cap() {
+        static const size_t c = [](){ const char* e = std::getenv("RKNPU_MAX_MCTX");
+                                      return e && std::atoll(e) > 0 ? (size_t)std::atoll(e) : 1800; }();
+        return c;
+    }
 
     // A-matrices cache (M_op, K_seg, npu_type_a, domain_id, tile m0, k offset)
     std::unordered_map<std::tuple<int, int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> a_buffer_cache;
@@ -462,6 +474,7 @@ struct ggml_backend_rknpu_context {
         auto key = std::make_tuple(tensor_id, offset, M, K, N, core_id, (int)type, (int)domain_id);
         auto it = matmul_ctx_cache.find(key);
         if (it != matmul_ctx_cache.end()) {
+            it->second->last_used = ++mctx_tick;
             return it->second;
         }
 
@@ -485,6 +498,15 @@ struct ggml_backend_rknpu_context {
             // Handle error
         }
 
+        ctx->last_used = ++mctx_tick;
+        while (matmul_ctx_cache.size() >= mctx_cap()) {
+            auto victim = matmul_ctx_cache.end();
+            for (auto jt = matmul_ctx_cache.begin(); jt != matmul_ctx_cache.end(); ++jt) {
+                if (victim == matmul_ctx_cache.end() || jt->second->last_used < victim->second->last_used) victim = jt;
+            }
+            if (victim == matmul_ctx_cache.end()) break;
+            matmul_ctx_cache.erase(victim);
+        }
         matmul_ctx_cache[key] = ctx;
         return ctx;
     }
@@ -552,11 +574,15 @@ static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
 template <typename CacheKeyType>
 static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     ggml_backend_rknpu_context* backend_ctx,
-    rknn_matmul_ctx matmul_ctx,
+    std::shared_ptr<struct rknpu_matmul_context> mctx_holder,
     size_t size,
     const CacheKeyType& key,
     std::unordered_map<CacheKeyType, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
 ) {
+    // Hold the owning context by shared_ptr: LRU eviction may destroy the cached
+    // context later, but a buffer created on it must never outlive the ctx handle
+    // it will be rknn_destroy_mem()'d with.
+    rknn_matmul_ctx matmul_ctx = mctx_holder ? mctx_holder->ctx : (rknn_matmul_ctx)0;
     std::lock_guard<std::mutex> lock(backend_ctx->mutex);
     auto it = cache.find(key);
     if (it != cache.end()) {
@@ -569,9 +595,9 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     if (!mem) { return nullptr; }
     if (rknpu_prof::enabled()) { if ((void*)&cache == (void*)&backend_ctx->a_buffer_cache) rknpu_prof::g.n_a_alloc++; else rknpu_prof::g.n_c_alloc++; }
 
-    auto deleter = [matmul_ctx](rknn_tensor_mem* m) {
-        if (m != 0) {
-            rknn_destroy_mem(matmul_ctx, m);
+    auto deleter = [mctx_holder](rknn_tensor_mem* m) {
+        if (m != 0 && mctx_holder) {
+            rknn_destroy_mem(mctx_holder->ctx, m);
         }
     };
 
@@ -767,69 +793,6 @@ static inline bool rk_tensor_overlap(const ggml_tensor * a, const ggml_tensor * 
     return a0 < b1 && b0 < a1;
 }
 
-// NEON C-matrix epilogue: dst = src * (sa*wscale), optionally accumulated.
-// Bit-identical to the scalar loops it replaces: int->float conversion is exact
-// for |x| < 2^24 (per-segment int8 dot products stay far below), the combined
-// scale sa*wscale[i] is rounded once before the product, and accumulation uses
-// explicit vmulq/vaddq — never fmla, which fuses into a single rounding on A76.
-static inline void rknpu_epi_f32(float * dst, const float * src, int n, float sa, const float * wscale, bool accum) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    int i = 0;
-    if (wscale) {
-        for (; i + 4 <= n; i += 4) {
-            float32x4_t w = vmulq_f32(vld1q_f32(wscale + i), vdupq_n_f32(sa));
-            float32x4_t p = vmulq_f32(vld1q_f32(src + i), w);
-            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
-            vst1q_f32(dst + i, p);
-        }
-    } else {
-        for (; i + 4 <= n; i += 4) {
-            float32x4_t p = vmulq_f32(vld1q_f32(src + i), vdupq_n_f32(sa));
-            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
-            vst1q_f32(dst + i, p);
-        }
-    }
-    for (; i < n; ++i) {
-        float p = src[i] * (wscale ? wscale[i] * sa : sa);
-        dst[i] = accum ? dst[i] + p : p;
-    }
-#else
-    for (int i = 0; i < n; ++i) {
-        float p = src[i] * (wscale ? wscale[i] * sa : sa);
-        dst[i] = accum ? dst[i] + p : p;
-    }
-#endif
-}
-
-static inline void rknpu_epi_i32(float * dst, const int32_t * src, int n, float sa, const float * wscale, bool accum) {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    int i = 0;
-    if (wscale) {
-        for (; i + 4 <= n; i += 4) {
-            float32x4_t w = vmulq_f32(vld1q_f32(wscale + i), vdupq_n_f32(sa));
-            float32x4_t p = vmulq_f32(vcvtq_f32_s32(vld1q_s32(src + i)), w);
-            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
-            vst1q_f32(dst + i, p);
-        }
-    } else {
-        for (; i + 4 <= n; i += 4) {
-            float32x4_t p = vmulq_f32(vcvtq_f32_s32(vld1q_s32(src + i)), vdupq_n_f32(sa));
-            if (accum) p = vaddq_f32(vld1q_f32(dst + i), p);
-            vst1q_f32(dst + i, p);
-        }
-    }
-    for (; i < n; ++i) {
-        float p = (float)src[i] * (wscale ? wscale[i] * sa : sa);
-        dst[i] = accum ? dst[i] + p : p;
-    }
-#else
-    for (int i = 0; i < n; ++i) {
-        float p = (float)src[i] * (wscale ? wscale[i] * sa : sa);
-        dst[i] = accum ? dst[i] + p : p;
-    }
-#endif
-}
-
 static void rk_job_quant(ggml_backend_rknpu_context * backend_ctx, RkJob & jb) {
     UNUSED(backend_ctx);
     if (!jb.need_quant) return;
@@ -896,10 +859,17 @@ static void rk_job_dequant(RkJob & jb) {
             float* dst_ptr = dst_tile + (size_t)m * N + N_offset;
             if (npu_type_c == rknpu2_configuration::NPU_TYPE_FP32) {
                 const float* src_ptr = (const float*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
-                rknpu_epi_f32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
+                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
             } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT32) {
                 const int32_t* src_ptr = (const int32_t*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
-                rknpu_epi_i32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
+                if (wscale) {
+                    if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * wscale[n]); }
+                    else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * (sa * wscale[n]); }
+                } else {
+                    if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * sa; }
+                    else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * sa; }
+                }
             } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT16) {
                 const int16_t* src_ptr = (const int16_t*)jb.C[idx]->virt_addr + (size_t)m * N_segment;
                 if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
@@ -1040,7 +1010,7 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
                     auto cache_key = std::make_tuple(M_op, K_seg_op, (int)pipeline->npu_type_a, b_domain_id, m0, k_seg.offset_k);
                     {
                     RKPROF(ST_GET_A);
-                    jb.A = get_tensor_buffer(backend_ctx, jb.ctx[0]->ctx, jb.ctx[0]->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+                    jb.A = get_tensor_buffer(backend_ctx, jb.ctx[0], jb.ctx[0]->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
                     }
                     if (!jb.A) return GGML_STATUS_FAILED;
                     auto& astate = backend_ctx->a_state[jb.A.get()];
@@ -1065,7 +1035,7 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
                     for (size_t idx = 0; idx < num_active_segments; idx++) {
                         auto cache_key = std::make_tuple(M_op, active_n_segments[idx].size_n, active_n_segments[idx].core_id,
                                                          (int)pipeline->npu_type_c + 1000 * (slot + 1), b_domain_id);
-                        jb.C[idx] = get_tensor_buffer(backend_ctx, jb.ctx[idx]->ctx, jb.ctx[idx]->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                        jb.C[idx] = get_tensor_buffer(backend_ctx, jb.ctx[idx], jb.ctx[idx]->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
                         if (!jb.C[idx]) return GGML_STATUS_FAILED;
                     }
                 }
@@ -1862,7 +1832,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 // Getting A-buffer from cache
                 {
                 RKPROF(ST_GET_A);
-                mem_A_shared = get_tensor_buffer(backend_ctx, matmul_ctx_0->ctx, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+                mem_A_shared = get_tensor_buffer(backend_ctx, matmul_ctx_0, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
                 }
                 if (!mem_A_shared) return GGML_STATUS_FAILED;
 
@@ -1943,7 +1913,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     auto cache_key = std::make_tuple(M_op, active_n_segments[idx].size_n, active_n_segments[idx].core_id, (int)pipeline->npu_type_c, b_domain_id);
 
                     // Getting C-buffer from cache
-                    mem_C_segments[idx] = get_tensor_buffer(backend_ctx, matmul_ctx->ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                    mem_C_segments[idx] = get_tensor_buffer(backend_ctx, matmul_ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
                     if (!mem_C_segments[idx]) return GGML_STATUS_FAILED;
 
                     // Assigning C-matrix to current context for the parallel execution
@@ -2003,10 +1973,17 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         float* dst_ptr = dst_tile + (size_t)m * N + N_offset;
                         if (npu_type_c == rknpu2_configuration::NPU_TYPE_FP32) {
                             const float* src_ptr = (const float*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-                            rknpu_epi_f32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
+                            if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
+                            else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
                         } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT32) {
                             const int32_t* src_ptr = (const int32_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-                            rknpu_epi_i32(dst_ptr, src_ptr, N_segment, sa, wscale, !first_k);
+                            if (wscale) {
+                                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * wscale[n]); }
+                                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * (sa * wscale[n]); }
+                            } else {
+                                if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * sa; }
+                                else         { for (int n = 0; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * sa; }
+                            }
                         } else if (npu_type_c == rknpu2_configuration::NPU_TYPE_INT16) {
                             const int16_t* src_ptr = (const int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
                             if (first_k) { for (int n = 0; n < N_segment; ++n) dst_ptr[n]  = (float)src_ptr[n] * (sa * (wscale ? wscale[n] : 1.0f)); }
