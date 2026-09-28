@@ -1145,13 +1145,19 @@ static std::vector<int> row_lo, row_hi; static std::vector<uint8_t> row_clean;
 // Native-B mode (RKNPU_FA_NATIVE_B=1, default): the QK/PV matmul contexts take B already in the NPU native layout
 // (RK3588 fp16: (N/16, K/32, 16, 32)), so set_io_mem stops converting B on the CPU (4.9 us vs 186 us per bind,
 // measured). Native B is read at run time (verified on-device: new data behind an unchanged binding is picked up),
-// so B is bound once per buffer and per-layer refreshes only need the gather + mem_sync. QK's native K layout is
-// N-prefix compatible (one shared buffer per KV head; shorter Nq binds the same prefix), but PV's native V layout is
-// not (its stride depends on Nq), so each PV job interleaves its own window into the per-thread staging buffer.
+// so B is bound once per buffer and per-layer refreshes only need the gather + mem_sync. Both K and V windows are
+// staged into per-thread buffers before each job: attaching the shared per-KV-head dma-bufs to a matmul context
+// races the runtime's internal re-sync against other threads' in-flight submits (see the staging comment below).
 static bool rknpu_fa_native_b() {
+    // Native B is OPT-IN (RKNPU_FA_NATIVE_B=1). Under rapid shape switching + prefix reuse the native path
+    // intermittently serves wrong B data even with per-thread staging of K/V (the "new data behind an unchanged
+    // binding is picked up" assumption does not hold in all runtime paths): embeddings silently corrupt, with no
+    // API error returned (reproduced 2026-09-28: canary cos -0.03 right after a 2049-token request, while the
+    // legacy path stayed at 0.9965 through the same hammer). The legacy path re-binds B every job, which forces
+    // the runtime to re-read it, and is measurably correct under the same stress.
     static const bool ok = [](){
         const char * e = std::getenv("RKNPU_FA_NATIVE_B");
-        if (e && std::atoi(e) == 0) return false;
+        if (!e || std::atoi(e) == 0) return false;
         rknn_matmul_ctx c; rknn_matmul_info info; rknn_matmul_io_attr io;
         memset(&info, 0, sizeof(info)); memset(&io, 0, sizeof(io));
         info.M = 64; info.K = 128; info.N = 256; info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
@@ -1339,6 +1345,40 @@ static bool rknpu_fa_supported(const ggml_tensor * op) {
     return true;
 }
 
+// Exact fp32 CPU fallback for a failed NPU FA node. Correct but slow (O(n*nkv*D) per head); only taken when the
+// NPU path fails, so a transient driver error degrades this one node's latency instead of failing the request.
+static void rknpu_fa_reference(const ggml_tensor * dst, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
+                               const ggml_tensor * mask, float scale) {
+    const int D = (int)q->ne[0], n = (int)q->ne[1], H = (int)q->ne[2], nkv = (int)k->ne[1], Hkv = (int)k->ne[2], ratio = H / Hkv;
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < n; t++) {
+        std::vector<float> lg(nkv), ref(D);
+        const __fp16 * mh = mask ? (const __fp16 *)((const char *)mask->data + (size_t)t * mask->nb[1]) : nullptr;
+        const uint16_t * mr = (const uint16_t *)mh;
+        for (int h = 0; h < H; h++) {
+            const int g = h / ratio;
+            const float * qr = (const float *)((const char *)q->data + (size_t)t * q->nb[1] + (size_t)h * q->nb[2]);
+            float mx = -INFINITY;
+            for (int j = 0; j < nkv; j++) {
+                const __fp16 * kr = (const __fp16 *)((const char *)k->data + (size_t)j * k->nb[1] + (size_t)g * k->nb[2]);
+                float d = 0; for (int x = 0; x < D; x++) d += qr[x] * (float)kr[x];
+                const float mv = mh ? (float)mh[j] : 0.f;   // 0xFC00 (-inf) masks the key out below
+                lg[j] = d * scale + mv; mx = std::max(mx, lg[j]);
+            }
+            double sum = 0; std::fill(ref.begin(), ref.end(), 0.f);
+            for (int j = 0; j < nkv; j++) {
+                const float e = std::isinf(mx) || std::isinf(lg[j]) ? 0.f : expf(lg[j] - mx);
+                sum += e;
+                if (e == 0.f) continue;
+                const __fp16 * vr = (const __fp16 *)((const char *)v->data + (size_t)j * v->nb[1] + (size_t)g * v->nb[2]);
+                for (int x = 0; x < D; x++) ref[x] += e * (float)vr[x];
+            }
+            float * o = (float *)((char *)dst->data + (size_t)t * dst->nb[2] + (size_t)h * dst->nb[1]);
+            for (int x = 0; x < D; x++) o[x] = sum > 0 ? (float)(ref[x] / sum) : 0.f;
+        }
+    }
+}
+
 static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     using namespace rkfa;
     const bool prof = rknpu_prof::enabled();
@@ -1411,6 +1451,21 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
         if ((kskip || nat) && (!ensure(b.ks, (size_t)kvcap * D * 2) || !ensure(b.vs, (size_t)kvcap * D * 2))) return GGML_STATUS_FAILED;
         b.inv.resize(Mmax); b.mx4.resize(Mmax); b.sm4.resize(Mmax);
     }
+    // Pre-create every (shape, slot) matmul context the jobs may use, on this thread with no driver thread
+    // running: a lazily created context reconfigures the NPU while other driver threads have submits in flight
+    // ("failed to sync memory, ret: -1, errno: 22" / "failed to submit!, op name: MatMul"), which showed up as
+    // sporadic single-request 500s whenever a request arrived with a not-yet-cached (M, Nq) shape mid-run.
+    // After warm-up every get_ctx in the workers is a cache hit, so no create ever races a run.
+    {
+        std::vector<std::pair<int,int>> shapes;
+        for (const auto & jb : jobs) shapes.emplace_back(ratio * jb.mtp, jb.Nq);
+        std::sort(shapes.begin(), shapes.end());
+        shapes.erase(std::unique(shapes.begin(), shapes.end()), shapes.end());
+        for (const auto & sp : shapes)
+            for (int t = 0; t < nthr; t++) {
+                if (!get_ctx(sp.first, D, sp.second, nat ? 1 : 2, t) || !get_ctx(sp.first, sp.second, D, nat ? 1 : 0, t)) return GGML_STATUS_FAILED;
+            }
+    }
     // ---- 4. gather per-KV-head K/V from the (strided) F16 cache: native K layout, or legacy plain rows ----
     if (nat) {
         #pragma omp parallel for schedule(static)
@@ -1464,7 +1519,13 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             const int k0 = jb.k0;   // S/P column j <-> key k0 + j
             rknn_tensor_mem * kb = kbuf[jb.g].m, * vb = vbuf[jb.g].m;
             if (nat) {
-                if (k0 > 0) {   // K native layout is N-prefix compatible: stage whole (Nq/16) key blocks
+                {   // K is staged into this thread's buffer for EVERY job. Binding the shared kbuf[g] dma-buf as B
+                    // makes the runtime re-sync it inside rknn_matmul_run, which intermittently fails (EINVAL ->
+                    // "failed to submit") while another driver thread has the same dma-buf attached to an in-flight
+                    // submit (multi-tile nodes run several jobs per KV head concurrently). With per-thread staging
+                    // the B binding never changes after the first bind, so the shared buffer is never attached to a
+                    // matmul context at all. The legacy (non-native) path is unaffected: it converts B on the CPU at
+                    // set_io_mem time, so the NPU never reads the shared dma-buf directly.
                     const size_t blk = (size_t)(D / 32) * 512 * 2;
                     memcpy(b.ks.m->virt_addr, (const char *)kb->virt_addr + (size_t)(k0 / 16) * blk, (size_t)(Nq / 16) * blk);
                     if (rknn_mem_sync(cq->ctx, b.ks.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
@@ -1579,7 +1640,12 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
         for (int t = 0; t < nthr; t++) th.emplace_back(worker, t);
         for (auto & t : th) t.join();
     }
-    if (failed) { fprintf(stderr, "RKNPU FA: NPU attention failed\n"); return GGML_STATUS_FAILED; }
+    if (failed) {
+        static const bool cpu_fb = [](){ const char * e = std::getenv("RKNPU_FA_CPU_FALLBACK"); return !e || std::atoi(e) != 0; }();
+        if (!cpu_fb) { fprintf(stderr, "RKNPU FA: NPU attention failed\n"); return GGML_STATUS_FAILED; }
+        fprintf(stderr, "RKNPU FA: NPU attention failed, computing node on CPU (n=%d nkv=%d)\n", n, nkv);
+        rknpu_fa_reference(dst, q, k, v, mask, scale);
+    }
     static const int fa_check = rknpu_fa_env("RKNPU_FA_CHECK", 0);
     if (fa_check) {   // debug: fp32 reference for sampled rows
         double dot = 0, na = 0, nb = 0, maxe = 0; int worst_t = -1, worst_h = -1;
