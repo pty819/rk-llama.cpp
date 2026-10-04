@@ -65,6 +65,12 @@ const std::vector<std::string>* Rknpu2DeviceConfig::get_active_pattern(int tenso
 const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struct ggml_tensor* w_tensor) const {
     if (!w_tensor) return nullptr;
 
+    // Huge-N weights (tied lm_head / token_embd, N = n_vocab) run at ~28 GMAC/s on the
+    // matmul API (C = M_op x N int32 per core, hundreds of MB) vs ~800 GMAC/s for layer
+    // weights, and cost 150+ MB of DMA memory. Keep them on CPU. RKNPU_MAX_N overrides.
+    static const long max_n = [](){ const char* v = std::getenv("RKNPU_MAX_N"); return v ? std::atol(v) : 65536L; }();
+    if (max_n > 0 && w_tensor->ne[1] > max_n) return nullptr;
+
     auto find_pipeline = [this](const std::string& name) -> const Rknpu2HardwarePipeline* {
         for (const auto& pipe : hardware_pipelines) {
             if (pipe.pipeline_name == name) return &pipe;
@@ -212,6 +218,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     rk3588_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A8_STANDARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A8_STANDARD", "W4A4_HADAMARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q4_0] = {"W4A4_HADAMARD"};
+    // Q4_K_M GGUFs (no official Q4_0 for jina-v5): map like Q4_0
+    rk3588_config.default_patterns[(int)GGML_TYPE_Q4_K] = {"W4A4_HADAMARD"};
 
     device_configs["RK3588"] = rk3588_config;
 

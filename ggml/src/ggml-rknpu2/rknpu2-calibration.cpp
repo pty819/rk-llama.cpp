@@ -7,176 +7,12 @@
 #include <cstring>
 #include <omp.h>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define RKNPU2_HAS_NEON 1
+#endif
+
 namespace rknpu2_calibration {
-
-// --- Calibration Implementations ---
-
-float calculate_percentile_amax(const float * data, size_t n_elements, float percentile) {
-    if (n_elements == 0) {
-        return 0.0f;
-    }
-
-    // Creating a vector of absolute values. We need a mutable copy to use nth_element.
-    std::vector<float> abs_values(n_elements);
-    #pragma omp parallel for
-    for (size_t i = 0; i < n_elements; ++i) {
-        abs_values[i] = std::abs(data[i]);
-    }
-
-    // Finding the index corresponding to the percentile
-    size_t index = static_cast<size_t>((float)n_elements * percentile / 100.0f);
-
-    // Clamping the index to be within the valid range
-    index = std::min(index, n_elements - 1);
-
-    // Useing std::nth_element to find the k-th smallest element without a full sort.
-    std::nth_element(abs_values.begin(), abs_values.begin() + index, abs_values.end());
-
-    return abs_values[index];
-}
-
-float calculate_min_mse_amax(const float * data, size_t n_elements, int num_steps) {
-    if (n_elements == 0) {
-        return 0.0f;
-    }
-
-    // Determining search range for amax
-    float abs_max_val = 0.0f;
-    for (size_t i = 0; i < n_elements; ++i) {
-        abs_max_val = std::max(abs_max_val, std::abs(data[i]));
-    }
-    if (abs_max_val == 0.0f) {
-        return 0.0f;
-    }
-    // Using a high percentile as the lower bound to narrow the search range
-    float percentile_max_val = calculate_percentile_amax(data, n_elements, 99.9f);
-
-    float search_min = percentile_max_val;
-    float search_max = abs_max_val;
-
-    if (search_min >= search_max) {
-        return search_max;
-    }
-
-    // Iteratively searching for the best amax
-    float best_amax = search_max;
-    double min_mse = std::numeric_limits<double>::max();
-    const float step_size = (search_max - search_min) / num_steps;
-
-    for (int i = 0; i < num_steps; ++i) {
-        const float current_amax = search_min + (float)i * step_size;
-        const float current_scale = current_amax / 7.0f;
-        if (current_scale < 1e-9f) continue;
-        const float iscale = 1.0f / current_scale;
-
-        // Calculating MSE for the current amax candidate
-        double current_mse = 0.0;
-        #pragma omp parallel for reduction(+:current_mse)
-        for (size_t j = 0; j < n_elements; ++j) {
-            const float original_val = data[j];
-            
-            // Quantizing
-            const float quantized_f = original_val * iscale;
-            const int8_t quantized_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(quantized_f)));
-            
-            // De-quantizing
-            const float dequantized_val = (float)quantized_i * current_scale;
-            
-            // Accumulating error
-            const double diff = (double)original_val - (double)dequantized_val;
-            current_mse += diff * diff;
-        }
-
-        if (current_mse < min_mse) {
-            min_mse = current_mse;
-            best_amax = current_amax;
-        }
-    }
-    return best_amax;
-}
-
-float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins, int num_steps) {
-    if (n_elements == 0) {
-        return 0.0f;
-    }
-
-    // Defining search range and creating reference distribution P
-    float abs_max_val = 0.0f;
-    for (size_t i = 0; i < n_elements; ++i) {
-        abs_max_val = std::max(abs_max_val, std::abs(data[i]));
-    }
-    if (abs_max_val == 0.0f) {
-        return 0.0f;
-    }
-
-    std::vector<double> p_dist(num_bins, 0.0);
-    const double bin_width = (double)abs_max_val * 2.0 / num_bins;
-    for (size_t i = 0; i < n_elements; ++i) {
-        int bin_index = static_cast<int>(((data[i] + abs_max_val) / bin_width));
-        bin_index = std::min(num_bins - 1, bin_index);
-        p_dist[bin_index]++;
-    }
-
-    // Normalizing histogram to a probability distribution, adding epsilon for stability
-    const double epsilon = 1e-9;
-    for (int i = 0; i < num_bins; ++i) {
-        p_dist[i] = (p_dist[i] / n_elements) + epsilon;
-    }
-
-    // Iteratively searching for the best amax by minimizing KL-divergence
-    float best_amax = abs_max_val;
-    double min_kl_div = std::numeric_limits<double>::max();
-    
-    // Narrowing the search range to avoid wasting time on obviously bad values
-    const float search_min = calculate_percentile_amax(data, n_elements, 99.5f);
-    const float search_max = abs_max_val;
-    const float step_size = (search_max - search_min) / num_steps;
-
-    for (int i = 0; i < num_steps; ++i) {
-        const float current_amax = search_min + (float)i * step_size;
-        const float current_scale = current_amax / 7.0f;
-        if (current_scale < 1e-9f) continue;
-        const float iscale = 1.0f / current_scale;
-
-        // Creating quantized distribution Q based on P
-        std::vector<double> q_dist(num_bins, 0.0);
-        for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
-            const float original_val = -abs_max_val + (bin_idx + 0.5f) * bin_width;
-
-            // Quantizing-dequantizing the value from the center of the bin
-            const float quantized_f = original_val * iscale;
-            const int8_t quantized_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(quantized_f)));
-            const float dequantized_val = (float)quantized_i * current_scale;
-
-            // Finding which bin the de-quantized value falls into
-            int new_bin_idx = static_cast<int>(((dequantized_val + abs_max_val) / bin_width));
-            new_bin_idx = std::max(0, std::min(num_bins - 1, new_bin_idx));
-
-            // Transfering the "probability mass" from the old bin to the new one
-            q_dist[new_bin_idx] += p_dist[bin_idx];
-        }
-
-        // Normalizing Q
-        for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
-            q_dist[bin_idx] += epsilon;
-        }
-
-        // Calculating KL-divergence
-        double current_kl_div = 0.0;
-        for (int bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
-            if (p_dist[bin_idx] > epsilon * 1.1) {
-                current_kl_div += p_dist[bin_idx] * log(p_dist[bin_idx] / q_dist[bin_idx]);
-            }
-        }
-
-        if (current_kl_div < min_kl_div) {
-            min_kl_div = current_kl_div;
-            best_amax = current_amax;
-        }
-    }
-    return best_amax;
-}
-
 
 // --- Hadamard Transform Implementations ---
 
@@ -209,6 +45,77 @@ int next_power_of_two(int n) {
     n |= n >> 16;
     n++;
     return n;
+}
+
+// Fused activation-side Hadamard prep: out = FWHT(pad_zero(src * s)).
+// Element-wise NEON mul/add/sub round identically to the scalar reference, so the
+// result is bit-identical to the original signed_row -> hadamard_transform sequence.
+// `out` must hold K_op floats; callers reuse a thread-local scratch buffer.
+void hadamard_signed_fwht(float* out, const float* src, const float* s, int K, int K_op) {
+#ifdef RKNPU2_HAS_NEON
+    if (K_op < 8) {  // vector stages below need a full 8-element block
+        for (int k = 0; k < K; ++k) out[k] = src[k] * s[k];
+        for (int k = K; k < K_op; ++k) out[k] = 0.0f;
+        fwht_iterative(out, K_op);
+        return;
+    }
+    int k = 0;
+    for (; k + 4 <= K; k += 4) {
+        vst1q_f32(out + k, vmulq_f32(vld1q_f32(src + k), vld1q_f32(s + k)));
+    }
+    for (; k < K; ++k) out[k] = src[k] * s[k];
+    for (; k < K_op; ++k) out[k] = 0.0f;
+
+    // FWHT stage h == 1: butterfly on adjacent pairs, 8 elements per iteration.
+    {
+        float* p = out;
+        float* end = out + K_op;
+        for (; p + 8 <= end; p += 8) {
+            float32x4_t a = vld1q_f32(p);
+            float32x4_t b = vld1q_f32(p + 4);
+            float32x4_t ev = vuzp1q_f32(a, b);   // x0 x2 x4 x6
+            float32x4_t od = vuzp2q_f32(a, b);   // x1 x3 x5 x7
+            float32x4_t sm = vaddq_f32(ev, od);
+            float32x4_t df = vsubq_f32(ev, od);
+            vst1q_f32(p,     vzip1q_f32(sm, df));  // (x0+x1) (x0-x1) (x2+x3) (x2-x3)
+            vst1q_f32(p + 4, vzip2q_f32(sm, df));  // (x4+x5) (x4-x5) (x6+x7) (x6-x7)
+        }
+    }
+    // FWHT stage h == 2: pairs (i, i+2), 8 elements per iteration.
+    {
+        float* p = out;
+        float* end = out + K_op;
+        for (; p + 8 <= end; p += 8) {
+            float32x4_t lo = vld1q_f32(p);
+            float32x4_t hi = vld1q_f32(p + 4);
+            float32x4_t f  = vcombine_f32(vget_low_f32(lo),  vget_low_f32(hi));   // x0 x1 x4 x5
+            float32x4_t sc = vcombine_f32(vget_high_f32(lo), vget_high_f32(hi));  // x2 x3 x6 x7
+            float32x4_t sm = vaddq_f32(f, sc);
+            float32x4_t df = vsubq_f32(f, sc);
+            vst1_f32(p,     vget_low_f32(sm));   // -> p+0, p+1
+            vst1_f32(p + 2, vget_low_f32(df));   // -> p+2, p+3
+            vst1_f32(p + 4, vget_high_f32(sm));  // -> p+4, p+5
+            vst1_f32(p + 6, vget_high_f32(df));  // -> p+6, p+7
+        }
+    }
+    // FWHT stages h >= 4: plain 4-wide butterfly between blocks h apart.
+    for (int h = 4; h < K_op; h <<= 1) {
+        for (int i = 0; i < K_op; i += h * 2) {
+            float* x = out + i;
+            float* y = out + i + h;
+            for (int j = 0; j < h; j += 4) {
+                float32x4_t xv = vld1q_f32(x + j);
+                float32x4_t yv = vld1q_f32(y + j);
+                vst1q_f32(x + j, vaddq_f32(xv, yv));
+                vst1q_f32(y + j, vsubq_f32(xv, yv));
+            }
+        }
+    }
+#else
+    for (int k = 0; k < K; ++k) out[k] = src[k] * s[k];
+    for (int k = K; k < K_op; ++k) out[k] = 0.0f;
+    fwht_iterative(out, K_op);
+#endif
 }
 
 void hadamard_transform(float* dst, const float* src, int K, int padded_size) {

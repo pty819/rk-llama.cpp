@@ -12,37 +12,6 @@
  */
 namespace rknpu2_calibration {
 
-// --- Calibration Implementations ---
-
-/**
- * @brief Finds the absolute maximum value based on a given percentile.
- * @param data Pointer to the source float data.
- * @param n_elements The number of elements in the data array.
- * @param percentile The percentile to calculate (e.g., 99.9f).
- * @return The absolute value at the specified percentile.
- */
-float calculate_percentile_amax(const float * data, size_t n_elements, float percentile);
-
-/**
- * @brief Finds the optimal amax by iteratively minimizing Mean Squared Error (MSE).
- * @param data Pointer to the source float data.
- * @param n_elements The number of elements in the data array.
- * @param num_steps The number of steps to iterate through in the search space.
- * @return The amax value that results in the lowest quantization error.
- */
-float calculate_min_mse_amax(const float * data, size_t n_elements, int num_steps = 128);
-
-/**
- * @brief Finds the optimal amax by minimizing KL-Divergence between FP32 and INT4 distributions.
- * @param data Pointer to the source float data.
- * @param n_elements The number of elements in the data array.
- * @param num_bins The number of bins for the histogram distributions.
- * @param num_steps The number of steps to iterate through in the search space.
- * @return The amax value that minimizes the information loss.
- */
-float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins = 2048, int num_steps = 128);
-
-
 // --- Hadamard Transform Implementations ---
 
 /**
@@ -57,6 +26,16 @@ float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins 
  * @param padded_size The target size for the transform (must be a power of two >= K). The full result is written to dst.
  */
 void hadamard_transform(float* dst, const float* src, int K, int padded_size);
+
+/**
+ * @brief Fused sign-multiply + zero-pad + FWHT for activation rows (NEON when available).
+ *
+ * Computes out[0..K_op) = FWHT([src[0..K) * s[0..K), 0...0]). Element-wise ops keep the
+ * exact rounding of the scalar reference, so results are bit-identical to
+ * hadamard_transform applied to a pre-signed row. `out` must hold K_op floats and is
+ * expected to be a caller-owned reusable scratch buffer.
+ */
+void hadamard_signed_fwht(float* out, const float* src, const float* s, int K, int K_op);
 
 /**
  * @brief Calculates the next power of two for a given integer.

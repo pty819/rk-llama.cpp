@@ -2952,6 +2952,8 @@ struct ggml_cplan ggml_graph_plan(
                         // Tiled flash attention scratch (tile sizes defined in common.h)
                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
                         size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
+                        // opt1: mask class table [q tiles][kv tiles] (bytes) after the per-thread scratch
+                        prefill += 64 + (size_t)((node->src[0]->ne[1] + GGML_FA_TILE_Q - 1)/GGML_FA_TILE_Q)*(size_t)((node->src[1]->ne[1] + GGML_FA_TILE_KV - 1)/GGML_FA_TILE_KV);
 
                         // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                         // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
@@ -3057,6 +3059,26 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// ---- opt1: per-op wall-time profiler (env GGML_CPU_OPPROF=1), thread 0 measures node start -> post-barrier ----
+static int     g_opprof = -1;
+static double  g_opprof_us[GGML_OP_COUNT];
+static int64_t g_opprof_n[GGML_OP_COUNT];
+static double  g_opprof_graph_us;
+static int64_t g_opprof_graphs;
+static void ggml_opprof_dump(void) {
+    double tot = 0; int idx[GGML_OP_COUNT];
+    for (int i = 0; i < GGML_OP_COUNT; i++) { tot += g_opprof_us[i]; idx[i] = i; }
+    for (int i = 0; i < GGML_OP_COUNT; i++) for (int j = i + 1; j < GGML_OP_COUNT; j++)
+        if (g_opprof_us[idx[j]] > g_opprof_us[idx[i]]) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    fprintf(stderr, "[opprof] cpu graphs=%lld graph_wall=%.1f ms node_sum=%.1f ms\n", (long long) g_opprof_graphs, g_opprof_graph_us/1e3, tot/1e3);
+    for (int k = 0; k < GGML_OP_COUNT; k++) { int i = idx[k]; if (g_opprof_n[i] == 0) continue;
+        fprintf(stderr, "[opprof] %-18s %10.1f ms %6.1f%% n=%lld\n", ggml_op_name((enum ggml_op) i), g_opprof_us[i]/1e3, 100.0*g_opprof_us[i]/(tot > 0 ? tot : 1), (long long) g_opprof_n[i]); }
+}
+static inline int ggml_opprof_on(void) {
+    if (g_opprof < 0) { const char * e = getenv("GGML_CPU_OPPROF"); g_opprof = (e && atoi(e) > 0) ? 1 : 0; if (g_opprof) atexit(ggml_opprof_dump); }
+    return g_opprof;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3097,6 +3119,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const int64_t opprof_t0 = (g_opprof > 0 && state->ith == 0) ? ggml_time_us() : 0;
+        const enum ggml_op opprof_op = node->op;
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3115,6 +3139,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+        if (opprof_t0) { g_opprof_us[opprof_op] += (double)(ggml_time_us() - opprof_t0); g_opprof_n[opprof_op]++; }
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3356,6 +3381,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
+    const int64_t opprof_g0 = ggml_opprof_on() ? ggml_time_us() : 0;
 
     bool disposable_threadpool = false;
 
@@ -3416,6 +3442,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     clear_numa_thread_affinity();
 
     enum ggml_status ret = threadpool->ec;
+    if (opprof_g0) { g_opprof_graph_us += (double)(ggml_time_us() - opprof_g0); g_opprof_graphs++; }
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);

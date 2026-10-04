@@ -8991,6 +8991,542 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     }
 }
 
+// ---- opt1 (2026-09-25): NEON tiled flash attention for prefill (aarch64) ----
+// Differences vs ggml_compute_forward_flash_attn_ext_tiled:
+//  * scores are computed transposed, S^T[kv][q] = K_f32[kv][:] . Qt[:][q], so K needs only a contiguous (vectorized)
+//    f16->f32 row conversion instead of a scalar transposed pack; Q is transposed + pre-scaled once per Q tile.
+//  * NEON register-blocked micro-kernels (4x16 fp32, fmla by lane): 16 accumulators (upstream simd_gemm falls back to
+//    2x2 vectors on aarch64 because it tests __ARM_NEON__, which aarch64 compilers do not define).
+//  * online softmax vectorized across the 64 query columns; P^T is consumed directly by the PV kernel (no transpose).
+//  * mask tiles are classified from raw fp16 bits (all -inf -> skip tile, all 0 -> no mask add); only mixed tiles
+//    (the causal diagonal) are converted.
+// Disable at runtime with GGML_FA_OPT1=0 (falls back to the upstream tiled kernel).
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#define GGML_FA_OPT1_NEON 1
+
+#ifndef GGML_FA_OPT1_DEFAULT
+#define GGML_FA_OPT1_DEFAULT 2
+#endif
+static int ggml_fa_opt1_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FA_OPT1"); v = e ? atoi(e) : GGML_FA_OPT1_DEFAULT; }
+    return v;
+}
+
+#define FA1_STEP(kk) \
+    { const float32x4_t b0 = vld1q_f32(B + (k + kk)*ldb + 0), b1 = vld1q_f32(B + (k + kk)*ldb + 4), \
+                        b2 = vld1q_f32(B + (k + kk)*ldb + 8), b3 = vld1q_f32(B + (k + kk)*ldb + 12); \
+      for (int i = 0; i < RM; i++) { \
+          c[i][0] = vfmaq_laneq_f32(c[i][0], b0, a[i], kk); c[i][1] = vfmaq_laneq_f32(c[i][1], b1, a[i], kk); \
+          c[i][2] = vfmaq_laneq_f32(c[i][2], b2, a[i], kk); c[i][3] = vfmaq_laneq_f32(c[i][3], b3, a[i], kk); } }
+
+// C[RM x 16] = A[RM x K] (row-major, lda) * B[K x 16] (ldb); K % 4 == 0. Overwrites C.
+template <int RM>
+static inline void fa1_ukernel_rowA(float * GGML_RESTRICT C, int ldc, const float * GGML_RESTRICT A, int lda,
+                                    const float * GGML_RESTRICT B, int ldb, int K) {
+    float32x4_t c[RM][4];
+    for (int i = 0; i < RM; i++) for (int r = 0; r < 4; r++) c[i][r] = vdupq_n_f32(0.0f);
+    for (int k = 0; k < K; k += 4) {
+        float32x4_t a[RM];
+        for (int i = 0; i < RM; i++) a[i] = vld1q_f32(A + i*lda + k);
+        FA1_STEP(0) FA1_STEP(1) FA1_STEP(2) FA1_STEP(3)
+    }
+    for (int i = 0; i < RM; i++) for (int r = 0; r < 4; r++) vst1q_f32(C + i*ldc + 4*r, c[i][r]);
+}
+#undef FA1_STEP
+
+// C[M x N] = A[M x K] * B[K x N]; N % 16 == 0, K % 4 == 0
+static void fa1_gemm_rowA(float * C, int ldc, const float * A, int lda, const float * B, int ldb, int M, int N, int K) {
+    for (int j = 0; j < N; j += 16) {
+        int i = 0;
+        for (; i + 4 <= M; i += 4) fa1_ukernel_rowA<4>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K);
+        switch (M - i) {
+            case 3: fa1_ukernel_rowA<3>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K); break;
+            case 2: fa1_ukernel_rowA<2>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K); break;
+            case 1: fa1_ukernel_rowA<1>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K); break;
+            default: break;
+        }
+    }
+}
+
+// C[4 x 16] += AT^T * B, AT is [K x 4-slice] (ldat), B [K x 16] (ldb). Accumulates into C.
+static inline void fa1_ukernel_AT(float * GGML_RESTRICT C, int ldc, const float * GGML_RESTRICT AT, int ldat,
+                                  const float * GGML_RESTRICT B, int ldb, int K) {
+    float32x4_t c[4][4];
+    for (int i = 0; i < 4; i++) for (int r = 0; r < 4; r++) c[i][r] = vld1q_f32(C + i*ldc + 4*r);
+    for (int k = 0; k < K; k++) {
+        const float32x4_t a  = vld1q_f32(AT + k*ldat);
+        const float32x4_t b0 = vld1q_f32(B + k*ldb + 0), b1 = vld1q_f32(B + k*ldb + 4),
+                          b2 = vld1q_f32(B + k*ldb + 8), b3 = vld1q_f32(B + k*ldb + 12);
+#define FA1_ROW(i) c[i][0] = vfmaq_laneq_f32(c[i][0], b0, a, i); c[i][1] = vfmaq_laneq_f32(c[i][1], b1, a, i); \
+                   c[i][2] = vfmaq_laneq_f32(c[i][2], b2, a, i); c[i][3] = vfmaq_laneq_f32(c[i][3], b3, a, i);
+        FA1_ROW(0) FA1_ROW(1) FA1_ROW(2) FA1_ROW(3)
+#undef FA1_ROW
+    }
+    for (int i = 0; i < 4; i++) for (int r = 0; r < 4; r++) vst1q_f32(C + i*ldc + 4*r, c[i][r]);
+}
+
+// C[M x N] += (AT)^T[M x K] * B[K x N]; AT stored [K][ldat], M % 4 == 0, N % 16 == 0
+static void fa1_gemm_AT(float * C, int ldc, const float * AT, int ldat, const float * B, int ldb, int M, int N, int K) {
+    for (int i = 0; i < M; i += 4) {
+        for (int j = 0; j < N; j += 16) {
+            fa1_ukernel_AT(C + i*ldc + j, ldc, AT + i, ldat, B + j, ldb, K);
+        }
+    }
+}
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#define GGML_FA_OPT1_F16 1
+// ---- fp16-arithmetic variant (GGML_FA_OPT1=2): K/V used in place from the f16 cache, fp16 FMA (8 lanes) with
+//      short fp16 accumulation chains widened into fp32 (QK: every FA1H_QK_CHUNK k, PV: per kv tile); softmax,
+//      running max/sum and the output accumulator stay fp32.
+static int fa1h_qk_chunk(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FA_OPT1_QKCHUNK"); v = e ? atoi(e) : 32; if (v != 32 && v != 64 && v != 128) v = 32; }
+    return v;
+}
+
+#define FA1H_STEP(kk) \
+    { const float16x8_t b0 = vld1q_f16(B + (k + kk)*ldb + 0),  b1 = vld1q_f16(B + (k + kk)*ldb + 8), \
+                        b2 = vld1q_f16(B + (k + kk)*ldb + 16), b3 = vld1q_f16(B + (k + kk)*ldb + 24); \
+      for (int i = 0; i < RM; i++) { \
+          c[i][0] = vfmaq_laneq_f16(c[i][0], b0, a[i], kk); c[i][1] = vfmaq_laneq_f16(c[i][1], b1, a[i], kk); \
+          c[i][2] = vfmaq_laneq_f16(c[i][2], b2, a[i], kk); c[i][3] = vfmaq_laneq_f16(c[i][3], b3, a[i], kk); } }
+
+// C[RM x 32] (fp32) = A[RM x K] (fp16 rows, lda) * B[K x 32] (fp16, ldb); K % FA1H_QK_CHUNK == 0
+template <int RM, int FA1H_QK_CHUNK>
+static inline void fa1h_ukernel_rowA(float * GGML_RESTRICT C, int ldc, const __fp16 * GGML_RESTRICT A, int64_t lda,
+                                     const __fp16 * GGML_RESTRICT B, int ldb, int K) {
+    float16x8_t c[RM][4];
+    for (int k0 = 0; k0 < K; k0 += FA1H_QK_CHUNK) {
+        for (int i = 0; i < RM; i++) for (int r = 0; r < 4; r++) c[i][r] = vdupq_n_f16(0);
+        for (int k = k0; k < k0 + FA1H_QK_CHUNK; k += 8) {
+            float16x8_t a[RM];
+            for (int i = 0; i < RM; i++) a[i] = vld1q_f16(A + i*lda + k);
+            FA1H_STEP(0) FA1H_STEP(1) FA1H_STEP(2) FA1H_STEP(3) FA1H_STEP(4) FA1H_STEP(5) FA1H_STEP(6) FA1H_STEP(7)
+        }
+        for (int i = 0; i < RM; i++) for (int r = 0; r < 4; r++) {
+            float * cp = C + i*ldc + 8*r;
+            float32x4_t lo = vcvt_f32_f16(vget_low_f16(c[i][r]));
+            float32x4_t hi = vcvt_high_f32_f16(c[i][r]);
+            if (k0) { lo = vaddq_f32(lo, vld1q_f32(cp)); hi = vaddq_f32(hi, vld1q_f32(cp + 4)); }
+            vst1q_f32(cp, lo); vst1q_f32(cp + 4, hi);
+        }
+    }
+}
+#undef FA1H_STEP
+
+template <int CH>
+static void fa1h_gemm_rowA_t(float * C, int ldc, const __fp16 * A, int64_t lda, const __fp16 * B, int ldb, int M, int N, int K) {
+    for (int j = 0; j < N; j += 32) {
+        int i = 0;
+        for (; i + 4 <= M; i += 4) fa1h_ukernel_rowA<4, CH>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K);
+        switch (M - i) {
+            case 3: fa1h_ukernel_rowA<3, CH>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K); break;
+            case 2: fa1h_ukernel_rowA<2, CH>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K); break;
+            case 1: fa1h_ukernel_rowA<1, CH>(C + i*ldc + j, ldc, A + i*lda, lda, B + j, ldb, K); break;
+            default: break;
+        }
+    }
+}
+static void fa1h_gemm_rowA(float * C, int ldc, const __fp16 * A, int64_t lda, const __fp16 * B, int ldb, int M, int N, int K) {
+    const int ch = fa1h_qk_chunk();
+    if (ch == 128 && K % 128 == 0)     fa1h_gemm_rowA_t<128>(C, ldc, A, lda, B, ldb, M, N, K);
+    else if (ch == 64 && K % 64 == 0)  fa1h_gemm_rowA_t<64>(C, ldc, A, lda, B, ldb, M, N, K);
+    else                               fa1h_gemm_rowA_t<32>(C, ldc, A, lda, B, ldb, M, N, K);
+}
+
+// exp(x) for x <= 0 (clamped at -87): Cody-Waite reduction + degree-5 polynomial, rel. error ~3e-6.
+// Only used where the result is rounded to fp16 (P for the fp16 PV product).
+static inline float32x4_t fa1_expf_fast(float32x4_t x) {
+    x = vmaxq_f32(x, vdupq_n_f32(-87.0f));
+    const float32x4_t n = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(1.44269504089f)));
+    float32x4_t r = vfmsq_f32(x, n, vdupq_n_f32(0.693145751953125f));
+    r = vfmsq_f32(r, n, vdupq_n_f32(1.428606765330187e-06f));
+    float32x4_t p = vfmaq_f32(vdupq_n_f32(1.0f/24.0f), r, vdupq_n_f32(1.0f/120.0f));
+    p = vfmaq_f32(vdupq_n_f32(1.0f/6.0f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), r, p);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), r, p);
+    const int32x4_t e = vshlq_n_s32(vcvtq_s32_f32(n), 23);
+    return vreinterpretq_f32_s32(vaddq_s32(vreinterpretq_s32_f32(p), e));
+}
+
+// C[8 x 16] (fp32) += AT^T * B; AT fp16 [K][ldat] (8 consecutive rows of C per k), B fp16 rows (ldb)
+static inline void fa1h_ukernel_AT(float * GGML_RESTRICT C, int ldc, const __fp16 * GGML_RESTRICT AT, int ldat,
+                                   const __fp16 * GGML_RESTRICT B, int64_t ldb, int K) {
+    float16x8_t c[8][2];
+    for (int i = 0; i < 8; i++) { c[i][0] = vdupq_n_f16(0); c[i][1] = vdupq_n_f16(0); }
+    for (int k = 0; k < K; k++) {
+        const float16x8_t a  = vld1q_f16(AT + k*ldat);
+        const float16x8_t b0 = vld1q_f16(B + k*ldb), b1 = vld1q_f16(B + k*ldb + 8);
+#define FA1H_ROW(i) c[i][0] = vfmaq_laneq_f16(c[i][0], b0, a, i); c[i][1] = vfmaq_laneq_f16(c[i][1], b1, a, i);
+        FA1H_ROW(0) FA1H_ROW(1) FA1H_ROW(2) FA1H_ROW(3) FA1H_ROW(4) FA1H_ROW(5) FA1H_ROW(6) FA1H_ROW(7)
+#undef FA1H_ROW
+    }
+    for (int i = 0; i < 8; i++) for (int r = 0; r < 2; r++) {
+        float * cp = C + i*ldc + 8*r;
+        vst1q_f32(cp,     vaddq_f32(vld1q_f32(cp),     vcvt_f32_f16(vget_low_f16(c[i][r]))));
+        vst1q_f32(cp + 4, vaddq_f32(vld1q_f32(cp + 4), vcvt_high_f32_f16(c[i][r])));
+    }
+}
+
+// C[M x N] += AT^T[M x K] * B[K x N]; M % 8 == 0, N % 16 == 0
+static void fa1h_gemm_AT(float * C, int ldc, const __fp16 * AT, int ldat, const __fp16 * B, int64_t ldb, int M, int N, int K) {
+    for (int j = 0; j < N; j += 16) {
+        for (int i = 0; i < M; i += 8) {
+            fa1h_ukernel_AT(C + i*ldc + j, ldc, AT + i, ldat, B + j, ldb, K);
+        }
+    }
+}
+#endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+// classify a mask tile from raw fp16 bits: 0 = all -inf (skip), 1 = all +-0 (no add), 2 = mixed
+static inline uint8_t fa1_classify_mask(const char * mbase, size_t nb1, int64_t q0, int nrows, int64_t k0, int ncols) {
+    bool all_ninf = true, all_zero = true;
+    const uint16x8_t vninf = vdupq_n_u16(0xFC00);
+    const uint16x8_t vabs  = vdupq_n_u16(0x7FFF);
+    for (int tq = 0; tq < nrows && (all_ninf || all_zero); tq++) {
+        const uint16_t * mr = (const uint16_t *) (mbase + (q0 + tq)*nb1) + k0;
+        int tk = 0;
+        uint16x8_t acc_ne = vdupq_n_u16(0), acc_nz = vdupq_n_u16(0);
+        for (; tk + 8 <= ncols; tk += 8) {
+            const uint16x8_t x = vld1q_u16(mr + tk);
+            acc_ne = vorrq_u16(acc_ne, veorq_u16(x, vninf));
+            acc_nz = vorrq_u16(acc_nz, vandq_u16(x, vabs));
+        }
+        if (vmaxvq_u16(acc_ne)) all_ninf = false;
+        if (vmaxvq_u16(acc_nz)) all_zero = false;
+        for (; tk < ncols; tk++) {
+            if (mr[tk] != 0xFC00) all_ninf = false;
+            if (mr[tk] & 0x7FFF)  all_zero = false;
+        }
+    }
+    return all_ninf ? 0 : (all_zero ? 1 : 2);
+}
+
+static int fa1_pack_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_FA_OPT1_PACK"); v = e ? atoi(e) : 1; }
+    return v;
+}
+
+static void ggml_compute_forward_flash_attn_ext_tiled_neon(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int ir0, int ir1,
+        const uint8_t * mtab, int64_t mtab_nkt) {   // mtab: precomputed mask classes [q tile][kv tile] (tiles aligned) or nullptr
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+
+    GGML_ASSERT(k->type == v->type);
+    const ggml_type kv_type = k->type;
+
+    const int64_t rk2 = neq2/nek2;
+    const int64_t rk3 = neq3/nek3;
+    const int64_t rv2 = neq2/nev2;
+    const int64_t rv3 = neq3/nev3;
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const int ith = params->ith;
+
+    static constexpr int QT = ggml_fa_tile_config::Q;   // query tile (columns of S^T)
+    static constexpr int KT = ggml_fa_tile_config::KV;  // kv tile (rows of S^T)
+    static_assert(QT % 16 == 0, "QT must be a multiple of 16");
+
+    // Per-thread scratch: same total size as the upstream tiled kernel
+    // (QT*DK + 2*QT*KT + QT*DV + KT*DV + KT*DK floats + cache line)
+    float * base  = (float *) params->wdata + ith*(QT*DK + 2*QT*KT + QT*DV + KT*DV + KT*DK + CACHE_LINE_SIZE_F32);
+    float * Qt    = base;                   // [DK][QT]  transposed, pre-scaled Q tile
+    float * ST    = Qt + QT*DK;             // [KT][QT]  scores / probabilities (transposed)
+    float * MT    = ST + KT*QT;             // [KT][QT]  mask (transposed), only for mixed tiles
+    float * VKQ32 = MT + KT*QT;             // [QT][DV]  output accumulator
+    float * V32   = VKQ32 + QT*DV;          // [KT][DV]
+    float * K32   = V32 + KT*DV;            // [KT][DK]
+#ifdef GGML_FA_OPT1_F16
+    const bool use_f16 = ggml_fa_opt1_enabled() == 2 && kv_type == GGML_TYPE_F16 && DK % 32 == 0 && DV % 16 == 0;
+    __fp16 * Qt16 = (__fp16 *) V32;         // [DK][QT] fp16 (aliases V32/K32, unused in the f16 path)
+    __fp16 * PT16 = (__fp16 *) K32;         // [KT][QT] fp16
+    // K/V tiles are packed contiguously into the (then unused) fp32 Qt area: rows in the KV cache are nbk1 apart
+    // (2 KiB here), which maps a 64-row tile onto only 8 L1 sets and causes conflict misses in the micro-kernels.
+    const bool pack_kv = use_f16 && (KT*DK + KT*DV)*2 <= QT*DK*4 && fa1_pack_enabled();
+    __fp16 * K16 = (__fp16 *) Qt;           // [KT][DK]
+    __fp16 * V16 = K16 + KT*DK;             // [KT][DV]
+#else
+    const bool use_f16 = false;
+#endif
+
+    alignas(16) float S[QT];
+    alignas(16) float M[QT];
+    alignas(16) float Msafe[QT];
+    alignas(16) float MS[QT];
+
+
+    int ir = ir0;
+    while (ir < ir1) {
+        const int iq3 = ir/(neq2*neq1);
+        const int iq2 = (ir - iq3*neq2*neq1)/neq1;
+        const int iq1 = (ir - iq3*neq2*neq1 - iq2*neq1);
+
+        const int tile_rows = MIN(QT, MIN((int)(ir1 - ir), (int)(neq1 - iq1)));
+        GGML_ASSERT(tile_rows > 0);
+        const int rows4 = (tile_rows + 3) & ~3;
+        const int rows8 = (tile_rows + 7) & ~7;
+
+        const uint32_t h = iq2;
+        const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+
+        for (int i = 0; i < QT; ++i) { S[i] = 0.0f; M[i] = -INFINITY; }
+        memset(VKQ32, 0, (size_t) QT*DV*sizeof(float));
+
+        const int ik3 = iq3 / rk3, ik2 = iq2 / rk2;
+        const int iv3 = iq3 / rv3, iv2 = iq2 / rv2;
+
+        // Q tile -> Qt[d][tq] * scale (zero for padded columns)
+        for (int tq = 0; tq < tile_rows; tq++) {
+            const float * pq = (const float *) ((const char *) q->data + ((iq1 + tq)*nbq1 + iq2*nbq2 + iq3*nbq3));
+            for (int64_t d = 0; d < DK; d++) Qt[d*QT + tq] = pq[d]*scale;
+        }
+        if (tile_rows < QT) {
+            for (int64_t d = 0; d < DK; d++) memset(Qt + d*QT + tile_rows, 0, (QT - tile_rows)*sizeof(float));
+        }
+#ifdef GGML_FA_OPT1_F16
+        if (use_f16) {
+            for (int64_t d = 0; d < DK; d++) for (int j = 0; j < QT; j += 8) {
+                vst1q_f16(Qt16 + d*QT + j, vcombine_f16(vcvt_f16_f32(vld1q_f32(Qt + d*QT + j)), vcvt_f16_f32(vld1q_f32(Qt + d*QT + j + 4))));
+            }
+        }
+#endif
+
+        const char * mask_base = mask ? (const char *) mask->data + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3] : nullptr;
+
+        for (int64_t ic = 0; ic < nek1; ic += KT) {
+            const int kv_tile = (int) std::min((int64_t) KT, nek1 - ic);
+
+            int mclass = 1;
+            if (mask) {
+                if (mtab) {
+                    mclass = mtab[(iq1/QT)*mtab_nkt + ic/KT];
+                } else {
+                    mclass = fa1_classify_mask(mask_base, mask->nb[1], iq1, tile_rows, ic, kv_tile);
+                }
+                if (mclass == 0) continue;
+                if (mclass == 2) {
+                    for (int tq = 0; tq < tile_rows; tq++) {
+                        const ggml_fp16_t * mr = (const ggml_fp16_t *) (mask_base + (iq1 + tq)*mask->nb[1]) + ic;
+                        for (int tk = 0; tk < kv_tile; tk++) MT[tk*QT + tq] = slope*GGML_CPU_FP16_TO_FP32(mr[tk]);
+                    }
+                    for (int tk = 0; tk < kv_tile; tk++) for (int tq = tile_rows; tq < QT; tq++) MT[tk*QT + tq] = 0.0f;
+                } else if (slope != 1.0f) {
+                    // all-zero mask scaled by slope is still zero
+                }
+            }
+
+            // K tile -> K32[kv][d] (contiguous rows)
+#ifdef GGML_FA_OPT1_F16
+            if (use_f16) {
+                const __fp16 * k0p = (const __fp16 *) ((const char *) k->data + ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                int64_t ldk = (int64_t)(nbk1/sizeof(ggml_fp16_t));
+                if (pack_kv) {
+                    for (int tk = 0; tk < kv_tile; tk++) memcpy(K16 + tk*DK, k0p + tk*ldk, DK*sizeof(ggml_fp16_t));
+                    k0p = K16; ldk = DK;
+                }
+                fa1h_gemm_rowA(ST, QT, k0p, ldk, Qt16, QT, kv_tile, QT, (int) DK);
+            } else
+#endif
+            {
+            for (int tk = 0; tk < kv_tile; tk++) {
+                const char * k_data = (const char *) k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                if (kv_type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) k_data, K32 + tk*DK, DK);
+                } else {
+                    memcpy(K32 + tk*DK, k_data, DK*sizeof(float));
+                }
+            }
+
+            // S^T[kv][q] = K32 * Qt
+            fa1_gemm_rowA(ST, QT, K32, (int) DK, Qt, QT, kv_tile, QT, (int) DK);
+            }
+
+            if (logit_softcap != 0.0f) {
+                for (int tk = 0; tk < kv_tile; tk++) {
+                    ggml_vec_tanh_f32(QT, ST + tk*QT, ST + tk*QT);
+                    ggml_vec_scale_f32(QT, ST + tk*QT, logit_softcap);
+                }
+            }
+            if (mclass == 2) {
+                for (int tk = 0; tk < kv_tile; tk++) {
+                    float * sr = ST + tk*QT; const float * mr = MT + tk*QT;
+                    for (int j = 0; j < QT; j += 4) vst1q_f32(sr + j, vaddq_f32(vld1q_f32(sr + j), vld1q_f32(mr + j)));
+                }
+            }
+
+            // online softmax, vectorized over the query columns
+            bool any_rescale = false;
+            for (int j = 0; j < QT; j += 4) {
+                float32x4_t mx = vdupq_n_f32(-INFINITY);
+                for (int tk = 0; tk < kv_tile; tk++) mx = vmaxq_f32(mx, vld1q_f32(ST + tk*QT + j));
+                const float32x4_t mold = vld1q_f32(M + j);
+                const float32x4_t mnew = vmaxq_f32(mold, mx);
+                const uint32x4_t  isinf = vceqq_f32(mnew, vdupq_n_f32(-INFINITY));
+                const float32x4_t msf  = vbslq_f32(isinf, vdupq_n_f32(0.0f), mnew);
+                const float32x4_t ms   = ggml_v_expf(vsubq_f32(mold, msf));   // mold=-inf -> 0 (acc is 0 anyway)
+                vst1q_f32(M + j, mnew);
+                vst1q_f32(Msafe + j, msf);
+                vst1q_f32(MS + j, ms);
+                vst1q_f32(S + j, vmulq_f32(vld1q_f32(S + j), ms));
+                if (vminvq_f32(ms) != 1.0f) any_rescale = true;
+            }
+            for (int j = 0; j < QT; j += 4) {
+                const float32x4_t msf = vld1q_f32(Msafe + j);
+                float32x4_t sum = vdupq_n_f32(0.0f);
+                for (int tk = 0; tk < kv_tile; tk++) {
+#ifdef GGML_FA_OPT1_F16
+                    if (use_f16) {
+                        const float16x4_t ph = vcvt_f16_f32(fa1_expf_fast(vsubq_f32(vld1q_f32(ST + tk*QT + j), msf)));
+                        vst1_f16(PT16 + tk*QT + j, ph);
+                        sum = vaddq_f32(sum, vcvt_f32_f16(ph));
+                        continue;
+                    }
+#endif
+                    const float32x4_t p = ggml_v_expf(vsubq_f32(vld1q_f32(ST + tk*QT + j), msf));
+                    vst1q_f32(ST + tk*QT + j, p);
+                    sum = vaddq_f32(sum, p);
+                }
+                vst1q_f32(S + j, vaddq_f32(vld1q_f32(S + j), sum));
+            }
+            if (any_rescale) {
+                for (int tq = 0; tq < rows4; tq++) {
+                    if (MS[tq] != 1.0f) ggml_vec_scale_f32((int) DV, VKQ32 + tq*DV, MS[tq]);
+                }
+            }
+
+            // V tile -> V32, then VKQ32[q][:] += sum_kv P^T[kv][q] * V32[kv][:]
+#ifdef GGML_FA_OPT1_F16
+            if (use_f16) {
+                const __fp16 * v0p = (const __fp16 *) ((const char *) v->data + ic*nbv1 + iv2*nbv2 + iv3*nbv3);
+                int64_t ldv = (int64_t)(nbv1/sizeof(ggml_fp16_t));
+                if (pack_kv) {
+                    for (int tk = 0; tk < kv_tile; tk++) memcpy(V16 + tk*DV, v0p + tk*ldv, DV*sizeof(ggml_fp16_t));
+                    v0p = V16; ldv = DV;
+                }
+                fa1h_gemm_AT(VKQ32, (int) DV, PT16, QT, v0p, ldv, rows8, (int) DV, kv_tile);
+                continue;
+            }
+#endif
+            for (int tk = 0; tk < kv_tile; tk++) {
+                const char * v_data = (const char *) v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
+                if (kv_type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, V32 + tk*DV, DV);
+                } else {
+                    memcpy(V32 + tk*DV, v_data, DV*sizeof(float));
+                }
+            }
+            fa1_gemm_AT(VKQ32, (int) DV, ST, QT, V32, (int) DV, rows4, (int) DV, kv_tile);
+        }
+
+        if (sinks) {
+            const float s = ((float *)((char *) sinks->data))[h];
+            for (int tq = 0; tq < tile_rows; tq++) {
+                float ms = 1.0f, vs = 1.0f;
+                if (s > M[tq]) {
+                    ms = expf(M[tq] - s);
+                    ggml_vec_scale_f32(DV, VKQ32 + tq*DV, ms);
+                } else {
+                    vs = expf(s - M[tq]);
+                }
+                S[tq] = S[tq]*ms + vs;
+            }
+        }
+
+        for (int tq = 0; tq < tile_rows; tq++) {
+            const float S_inv = S[tq] == 0.0f ? 0.0f : 1.0f/S[tq];
+            ggml_vec_scale_f32(DV, VKQ32 + tq*DV, S_inv);
+            const int i1 = iq1 + tq;
+            memcpy((char *) dst->data + (iq3*ne2*ne1 + iq2 + i1*ne1)*nb1, VKQ32 + tq*DV, nb1);
+        }
+
+        ir += tile_rows;
+    }
+}
+// aligned q-tile scheduler for the opt1 kernel: work item = (head, q tile), heavy (late, causal) q tiles first;
+// mask tile classes computed once per op (shared by all heads) when the mask is broadcast over heads.
+static bool ggml_fa_opt1_try_compute(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    static constexpr int64_t QT = ggml_fa_tile_config::Q;
+    static constexpr int64_t KT = ggml_fa_tile_config::KV;
+    const int64_t DK = k->ne[0], DV = v->ne[0];
+    const int64_t neq1 = q->ne[1], neq2 = q->ne[2], neq3 = q->ne[3], nek1 = k->ne[1];
+    if (params->use_ref || ggml_fa_opt1_enabled() <= 0) return false;
+    if (q->type != GGML_TYPE_F32 || k->type != v->type || (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32)) return false;
+    if (neq1 < QT || DK % 4 != 0 || DV % 16 != 0) return false;
+    if (mask && mask->type != GGML_TYPE_F16) return false;
+    const int ith = params->ith, nth = params->nth;
+    const int64_t nqt = (neq1 + QT - 1)/QT, nkt = (nek1 + KT - 1)/KT;
+    const int64_t nitems = neq3*neq2*nqt;
+    uint8_t * tab = nullptr;
+    if (mask && mask->ne[2] == 1 && mask->ne[3] == 1) {
+        tab = (uint8_t *) ((float *) params->wdata + (size_t) nth*(QT*DK + 2*QT*KT + QT*DV + KT*DV + KT*DK + CACHE_LINE_SIZE_F32));
+        GGML_ASSERT((size_t)((char *) tab - (char *) params->wdata) + nqt*nkt <= params->wsize);
+        for (int64_t e = ith; e < nqt*nkt; e += nth) {
+            const int64_t qt = e / nkt, kt = e % nkt;
+            tab[e] = fa1_classify_mask((const char *) mask->data, mask->nb[1], qt*QT, (int) MIN(QT, neq1 - qt*QT), kt*KT, (int) MIN(KT, nek1 - kt*KT));
+        }
+    }
+    if (ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+    ggml_barrier(params->threadpool);
+    int64_t item = ith;
+    while (item < nitems) {
+        const int64_t hq  = item % (neq2*neq3);
+        const int64_t qt  = nqt - 1 - item / (neq2*neq3);
+        const int64_t iq3 = hq / neq2, iq2 = hq % neq2;
+        const int64_t ir0 = iq3*neq2*neq1 + iq2*neq1 + qt*QT;
+        const int64_t ir1 = ir0 + MIN(QT, neq1 - qt*QT);
+        ggml_compute_forward_flash_attn_ext_tiled_neon(params, dst, (int) ir0, (int) ir1, tab, nkt);
+        item = ggml_threadpool_chunk_add(params->threadpool, 1);
+    }
+    return true;
+}
+#endif // __aarch64__ && __ARM_NEON
+// ---- end opt1 ----
+
 // Reduction function: combines partial results across KV chunks
 // Partials layout in wdata: [n_q_heads][n_chunks][2 + DV]
 static void ggml_flash_attn_ext_reduce_partials(
@@ -9145,6 +9681,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
     } else {
 
+#ifdef GGML_FA_OPT1_NEON
+        if (ggml_fa_opt1_try_compute(params, dst)) {
+            return;
+        }
+#endif
         // total rows in q
         const int64_t nr = neq1*neq2*neq3;
 
