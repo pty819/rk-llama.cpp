@@ -234,8 +234,18 @@ static IOMMUDomainManager g_domain_manager;
         if (ret < 0) {                                                  \
             fprintf(stderr,"RKNN error %d at %s:%d: %s\n", ret,         \
                 __FILE__, __LINE__, msg);                               \
-            assert(false);                                              \
+            GGML_ABORT("RKNN call failed: %s (ret=%d)", msg, ret);      \
         }                                                               \
+    } while (0)
+
+#define RKNN_CHECK_RETURN(stmt, msg, failure)                            \
+    do {                                                               \
+        int ret = (stmt);                                              \
+        if (ret < 0) {                                                 \
+            fprintf(stderr, "RKNN error %d at %s:%d: %s\n", ret,       \
+                    __FILE__, __LINE__, msg);                           \
+            return failure;                                            \
+        }                                                              \
     } while (0)
 
 // --- Hashers ---
@@ -495,7 +505,7 @@ struct ggml_backend_rknpu_context {
 
         int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
         if (ret != RKNN_SUCC) {
-            // Handle error
+            return nullptr;
         }
 
         ctx->last_used = ++mctx_tick;
@@ -716,6 +726,7 @@ struct RkJob {
     std::shared_ptr<rknn_tensor_mem> A;
     std::shared_ptr<std::vector<float>> scales;
     double t_submit = 0;
+    int run_status[RK_MAX_SEG] = {0};
     double core_ms[RK_MAX_SEG] = {0};
     double core_end[RK_MAX_SEG] = {0};
     double core_start[RK_MAX_SEG] = {0};
@@ -753,6 +764,7 @@ struct RkNpuPool {
                 double t0 = prof ? rknpu_prof::now_ms() : 0.0;
                 if (prof) jb->core_start[i] = t0;
                 int ret = rknn_matmul_run(jb->ctx[i]->ctx);
+                jb->run_status[i] = ret;
                 if (ret != RKNN_SUCC) fprintf(stderr, "RKNPU: rknn_matmul_run failed ret=%d\n", ret);
                 if (prof) { jb->core_end[i] = rknpu_prof::now_ms(); jb->core_ms[i] = jb->core_end[i] - t0; }
             }
@@ -793,9 +805,9 @@ static inline bool rk_tensor_overlap(const ggml_tensor * a, const ggml_tensor * 
     return a0 < b1 && b0 < a1;
 }
 
-static void rk_job_quant(ggml_backend_rknpu_context * backend_ctx, RkJob & jb) {
+static bool rk_job_quant(ggml_backend_rknpu_context * backend_ctx, RkJob & jb) {
     UNUSED(backend_ctx);
-    if (!jb.need_quant) return;
+    if (!jb.need_quant) return true;
     RKPROF_BEGIN(t_qa);
     float * sA = jb.scales->data();
     void * dst_base = jb.A->virt_addr;
@@ -830,15 +842,16 @@ static void rk_job_quant(ggml_backend_rknpu_context * backend_ctx, RkJob & jb) {
     }
     RKPROF_END(t_qa, ST_QUANT_A);
     RKPROF(ST_SYNC_A);
-    RKNN_CHECK(rknn_mem_sync(jb.ctx[0]->ctx, jb.A.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
+    RKNN_CHECK_RETURN(rknn_mem_sync(jb.ctx[0]->ctx, jb.A.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE", false);
+    return true;
 }
 
-static void rk_job_dequant(RkJob & jb) {
-    if (jb.deq_done) return;
+static bool rk_job_dequant(RkJob & jb) {
+    if (jb.deq_done) return true;
     {
         RKPROF(ST_SYNC_C);
         for (int idx = 0; idx < jb.nseg; idx++) {
-            RKNN_CHECK(rknn_mem_sync(jb.ctx[idx]->ctx, jb.C[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
+            RKNN_CHECK_RETURN(rknn_mem_sync(jb.ctx[idx]->ctx, jb.C[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE", false);
         }
     }
     RKPROF(ST_DEQUANT);
@@ -878,6 +891,7 @@ static void rk_job_dequant(RkJob & jb) {
         }
     }
     jb.deq_done = true;
+    return true;
 }
 
 template <typename Cfg>
@@ -991,7 +1005,7 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
                                 if (!mem) return GGML_STATUS_FAILED;
                                 auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
                                 matmul_ctx->mem_B = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
-                                RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
+                                RKNN_CHECK_RETURN(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment", GGML_STATUS_FAILED);
                                 matmul_ctx->b_bound = true;
                             }
                             break;
@@ -1049,23 +1063,28 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
     int max_seg = 0;
     for (auto & jb : jobs) max_seg = std::max(max_seg, jb.nseg);
     RkNpuPool * pool = rknpu_get_pool(max_seg);
+    struct WaitPending {
+        RkNpuPool * pool;
+        ~WaitPending() { pool->wait(); }
+    } wait_pending{pool};
     const bool prof = rknpu_prof::enabled();
 
-    auto setio_submit = [&](RkJob & jb) {
+    auto setio_submit = [&](RkJob & jb) -> bool {
         {
         RKPROF(ST_SETIO_A);
         for (int idx = 0; idx < jb.nseg; idx++)
-            RKNN_CHECK(rknn_matmul_set_io_mem(jb.ctx[idx]->ctx, jb.A.get(), &jb.ctx[idx]->io_attr.A), "set_io_mem A for core");
+            RKNN_CHECK_RETURN(rknn_matmul_set_io_mem(jb.ctx[idx]->ctx, jb.A.get(), &jb.ctx[idx]->io_attr.A), "set_io_mem A for core", false);
         }
         {
         RKPROF(ST_SETIO_C);
         for (int idx = 0; idx < jb.nseg; idx++)
-            RKNN_CHECK(rknn_matmul_set_io_mem(jb.ctx[idx]->ctx, jb.C[idx].get(), &jb.ctx[idx]->io_attr.C), "set_io_mem C");
+            RKNN_CHECK_RETURN(rknn_matmul_set_io_mem(jb.ctx[idx]->ctx, jb.C[idx].get(), &jb.ctx[idx]->io_attr.C), "set_io_mem C", false);
         }
         if (prof) jb.t_submit = rknpu_prof::now_ms();
         pool->submit(&jb);
+        return true;
     };
-    auto wait_run = [&](RkJob & jb) {
+    auto wait_run = [&](RkJob & jb) -> bool {
         {
         RKPROF(ST_RUN);   // overlap mode: exposed (main-thread blocked) NPU wait
         pool->wait();
@@ -1080,30 +1099,34 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
             auto & e = rknpu_prof::g.run_by_shape[std::make_tuple(jb.M_op, jb.K_seg_op, jb.N)];
             e.first++; e.second += end - jb.t_submit;
         }
+        for (int idx = 0; idx < jb.nseg; idx++)
+            if (jb.run_status[idx] != RKNN_SUCC) return false;
+        return true;
     };
 
-    rk_job_quant(backend_ctx, jobs[0]);
+    if (!rk_job_quant(backend_ctx, jobs[0])) return GGML_STATUS_FAILED;
     for (int j = 0; j < J; ++j) {
         RkJob & cur = jobs[j];
-        setio_submit(cur);
+        if (!setio_submit(cur)) return GGML_STATUS_FAILED;
         bool waited = false;
-        if (j > 0) rk_job_dequant(jobs[j - 1]);
+        if (j > 0 && !rk_job_dequant(jobs[j - 1])) return GGML_STATUS_FAILED;
         if (j + 1 < J) {
             RkJob & nx = jobs[j + 1];
             if (nx.need_quant) {
                 const bool conflict_a = nx.A.get() == cur.A.get();
                 const bool dep = rk_tensor_overlap(nx.src1, cur.node);
                 if (conflict_a || dep) {
-                    wait_run(cur); waited = true;
+                    if (!wait_run(cur)) return GGML_STATUS_FAILED;
+                    waited = true;
                     if (prof) { if (dep) rknpu_prof::g.ov_stall_dep++; else rknpu_prof::g.ov_stall_a++; }
-                    if (dep) rk_job_dequant(cur);
+                    if (dep && !rk_job_dequant(cur)) return GGML_STATUS_FAILED;
                 }
-                rk_job_quant(backend_ctx, nx);
+                if (!rk_job_quant(backend_ctx, nx)) return GGML_STATUS_FAILED;
             }
         }
-        if (!waited) wait_run(cur);
+        if (!waited && !wait_run(cur)) return GGML_STATUS_FAILED;
     }
-    rk_job_dequant(jobs[J - 1]);
+    if (!rk_job_dequant(jobs[J - 1])) return GGML_STATUS_FAILED;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1174,7 +1197,9 @@ static Ctx * get_ctx(int M, int K, int N, int layout, int slot, Ctx * keep = nul
         rknn_matmul_destroy(c->ctx); delete c; return nullptr;
     }
     const int core = slot % 3;
-    rknn_matmul_set_core_mask(c->ctx, core == 0 ? RKNN_NPU_CORE_0 : core == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
+    if (rknn_matmul_set_core_mask(c->ctx, core == 0 ? RKNN_NPU_CORE_0 : core == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2) < 0) {
+        rknn_matmul_destroy(c->ctx); delete c; return nullptr;
+    }
     if (!anyctx) anyctx = c;
     create_ms += rknpu_prof::now_ms() - t0; n_create++;
     ctxs[key] = c;
@@ -1439,6 +1464,8 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             // softmax overlaps the other thread's matmul, so the pipeline is NPU-bound and CPU savings turn into sync
             // wait. Kept the original full scan; see the split profiler columns below for the breakdown.)
             const float * S = (const float *)b.s.m->virt_addr; __fp16 * P = (__fp16 *)b.p.m->virt_addr;
+            // Each job scans new logits; mx4 holds the previous job's softmax offset.
+            for (int r = 0; r < M; r++) b.mx4[r] = ninf;
             auto row_tok = [&](int r, int & t) -> bool { const int i = r % jb.mtp; t = jb.r0 + i; return i < jb.mtc; };
             for (int n4 = 0; n4 < Nq / 4; n4++) {
                 const int j0 = n4 * 4;
@@ -1758,7 +1785,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
                             matmul_ctx->mem_B = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
 
-                            RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
+                            RKNN_CHECK_RETURN(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment", GGML_STATUS_FAILED);
 
                             matmul_ctx->b_bound = true;
                         }
@@ -1839,7 +1866,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 RKPROF_END(t_qa, ST_QUANT_A);
                 {
                 RKPROF(ST_SYNC_A);
-                RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
+                RKNN_CHECK_RETURN(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE", GGML_STATUS_FAILED);
                 }
                 astate.epoch = backend_ctx->graph_epoch; astate.src1 = src1; astate.data = src1->data; astate.Mt = Mt;
                 astate.pipeline_a = (int)pipeline->npu_type_a; astate.hadamard = is_hadamard; astate.s_vec = s_vec;
@@ -1850,7 +1877,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 {
                 RKPROF(ST_SETIO_A);
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
-                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core");
+                    RKNN_CHECK_RETURN(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core", GGML_STATUS_FAILED);
                 }
                 }
             }
@@ -1869,7 +1896,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     if (!mem_C_segments[idx]) return GGML_STATUS_FAILED;
 
                     // Assigning C-matrix to current context for the parallel execution
-                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
+                    RKNN_CHECK_RETURN(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C", GGML_STATUS_FAILED);
                 }
             }
 
@@ -1879,16 +1906,19 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             {
                 RKPROF_BEGIN(t_run);
                 double core_ms[8] = {0};
+                std::atomic<bool> run_failed{false};
                 #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     double t0 = rknpu_prof::enabled() ? rknpu_prof::now_ms() : 0.0;
                     int ret = rknn_matmul_run(matmul_ctxs[idx]->ctx);
                     if (ret != RKNN_SUCC) {
+                        run_failed.store(true, std::memory_order_relaxed);
                         fprintf(stderr, "RKNPU: rknn_matmul_run failed ret=%d\n", ret);
                     }
                     if (rknpu_prof::enabled() && idx < 8) core_ms[idx] = rknpu_prof::now_ms() - t0;
                 }
                 RKPROF_END(t_run, ST_RUN);
+                if (run_failed.load(std::memory_order_relaxed)) return GGML_STATUS_FAILED;
                 if (rknpu_prof::enabled()) {
                     double mx = 0, sm = 0;
                     for (size_t idx = 0; idx < num_active_segments && idx < 8; idx++) { sm += core_ms[idx]; mx = std::max(mx, core_ms[idx]); }
@@ -1906,7 +1936,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 {
                 RKPROF(ST_SYNC_C);
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
-                    RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
+                    RKNN_CHECK_RETURN(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE", GGML_STATUS_FAILED);
                 }
                 }
                 RKPROF(ST_DEQUANT);
