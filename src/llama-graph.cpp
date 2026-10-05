@@ -1493,6 +1493,13 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul(ctx0, res, w_s);
     }
 
+    return build_lora_add(w, cur, res);
+}
+
+ggml_tensor * llm_graph_context::build_lora_add(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * res) const {
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
@@ -1600,9 +1607,27 @@ llm_graph_qkv llm_graph_context::build_qkv(
 
     ggml_tensor * Qcur, * Kcur, * Vcur;
 
-    if (layer.wqkv) {
+    ggml_tensor * wqkv = layer.wqkv;
+    if (!wqkv && layer.wqkv_rknpu) {
+        auto * qkv = ggml_mul_mat(ctx0, layer.wqkv_rknpu, cur);
+        cb(qkv, "wqkv", il);
+        auto project = [&](ggml_tensor * weight, int64_t width, int64_t offset, int64_t heads) {
+            auto * result = ggml_view_2d(ctx0, qkv, width, qkv->ne[1], qkv->nb[1], ggml_row_size(qkv->type, offset));
+            result = build_lora_add(weight, cur, result);
+            if (hparams.f_clamp_kqv > 0.0f) result = ggml_clamp(ctx0, result, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+            return ggml_view_3d(ctx0, result, n_embd_head, heads, n_tokens, ggml_row_size(result->type, n_embd_head), result->nb[1], 0);
+        };
+        Qcur = project(layer.wq, n_embd_q, 0, n_head);
+        Kcur = project(layer.wk, n_embd_kv, n_embd_q, n_head_kv);
+        Vcur = project(layer.wv, n_embd_kv, n_embd_q + n_embd_kv, n_head_kv);
+        cb(Qcur, "Qcur", il);
+        cb(Kcur, "Kcur", il);
+        cb(Vcur, "Vcur", il);
+        return {Qcur, Kcur, Vcur};
+    }
+    if (wqkv) {
         // fused QKV path
-        ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
+        ggml_tensor * qkv = build_lora_mm(wqkv, cur, layer.wqkv_s);
         cb(qkv, "wqkv", il);
         if (layer.wqkv_b) {
             qkv = ggml_add(ctx0, qkv, layer.wqkv_b);
@@ -1679,7 +1704,8 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * gate_up_weight) const {
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1703,7 +1729,15 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    ggml_tensor * projection_input = cur;
+    ggml_tensor * gate_up = nullptr;
+    if (gate_up_weight && up && gate && type_gate == LLM_FFN_PAR && cur->ne[2] == 1 && cur->ne[3] == 1) {
+        GGML_ASSERT(gate_up_weight->ne[0] == cur->ne[0] && gate_up_weight->ne[1] == gate->ne[1] + up->ne[1]);
+        gate_up = build_lora_mm(gate_up_weight, cur);
+        cb(gate_up, "ffn_gate_up", il);
+    }
+    ggml_tensor * tmp = gate_up ? ggml_view_2d(ctx0, gate_up, up->ne[1], gate_up->ne[1], gate_up->nb[1], ggml_row_size(gate_up->type, gate->ne[1])) : up ? build_lora_mm(up, cur) : cur;
+    if (gate_up) tmp = build_lora_add(up, projection_input, tmp);
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1725,7 +1759,8 @@ ggml_tensor * llm_graph_context::build_ffn(
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur);
+                    cur = gate_up ? ggml_view_2d(ctx0, gate_up, gate->ne[1], gate_up->ne[1], gate_up->nb[1], 0) : build_lora_mm(gate, cur);
+                    if (gate_up) cur = build_lora_add(gate, projection_input, cur);
                     cb(cur, "ffn_gate", il);
                 } break;
         }

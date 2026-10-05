@@ -10,6 +10,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -1066,6 +1067,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            max_n_tensors += hparams.n_layer()*2; // optional RKNPU projection weights
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1319,6 +1321,38 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+ggml_tensor * llama_model_loader::create_rknpu_concat(const llama_hparams & hparams, const std::string & name, const std::vector<ggml_tensor *> & parts) {
+    if (files.empty() || parts.size() < 2 || !parts[0]) return nullptr;
+    const ggml_tensor * first = parts[0];
+    if (first->type != GGML_TYPE_Q8_0 && first->type != GGML_TYPE_F16) return nullptr;
+    const char * pattern = std::getenv("RKNPU_HYBRID");
+    if (pattern && strchr(pattern, ',')) return nullptr;
+    int64_t rows = 0;
+    std::vector<std::string> names;
+    for (const auto * part : parts) {
+        if (!part || part->type != first->type || part->ne[0] != first->ne[0] || part->ne[2] != 1 || part->ne[3] != 1 || !ggml_is_contiguous(part) || !get_weight(part->name)) return nullptr;
+        rows += part->ne[1];
+        names.emplace_back(part->name);
+    }
+    for (auto & entry : ctx_map) {
+        if (strncmp(ggml_backend_buft_name(entry.first), "RKNPU", 5) != 0 || ggml_get_tensor(entry.second.get(), first->name) != first) continue;
+        for (const auto * part : parts) if (ggml_get_tensor(entry.second.get(), part->name) != part) return nullptr;
+        ggml_tensor meta = *first;
+        meta.ne[1] = rows;
+        meta.nb[2] = meta.nb[1] * rows;
+        meta.nb[3] = meta.nb[2];
+        ggml_set_name(&meta, name.c_str());
+        if (!weight_buft_supported(hparams, &meta, GGML_OP_MUL_MAT, entry.first, ggml_backend_buft_get_device(entry.first))) return nullptr;
+        auto * tensor = ggml_new_tensor_2d(entry.second.get(), first->type, first->ne[0], rows);
+        ggml_set_name(tensor, name.c_str());
+        concatenated_weights.emplace(name, std::move(names));
+        for (const auto * part : parts) metadata_only_weights.emplace(part->name);
+        LLAMA_LOG_INFO("%s: %s [%lld, %lld]\n", __func__, tensor->name, (long long)tensor->ne[0], (long long)tensor->ne[1]);
+        return tensor;
+    }
+    return nullptr;
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1526,6 +1560,29 @@ bool llama_model_loader::load_all_data(
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        if (metadata_only_weights.count(cur->name)) continue;
+        auto concatenated = concatenated_weights.find(cur->name);
+        if (concatenated != concatenated_weights.end()) {
+            if (progress_callback && !progress_callback((float)size_done / size_data, progress_callback_user_data)) return false;
+            read_buf.resize(ggml_nbytes(cur));
+            size_t offset = 0;
+            for (const auto & name : concatenated->second) {
+                const auto & part = require_weight(name.c_str());
+                const size_t bytes = ggml_nbytes(part.tensor);
+                if (use_mmap) {
+                    memcpy(read_buf.data() + offset, (const uint8_t *)mappings.at(part.idx)->addr() + part.offs, bytes);
+                } else {
+                    files.at(part.idx)->seek(part.offs, SEEK_SET);
+                    files.at(part.idx)->read_raw(read_buf.data() + offset, bytes);
+                }
+                offset += bytes;
+            }
+            GGML_ASSERT(offset == ggml_nbytes(cur));
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), offset)) throw std::runtime_error(format("tensor '%s' has invalid data", cur->name));
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, offset);
+            size_done += offset;
+            continue;
+        }
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
@@ -1571,7 +1628,8 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
+            // RKNPU exposes host-visible compute memory but weight uploads still require packing.
+            if (ggml_backend_buffer_is_host(cur->buffer) && strncmp(ggml_backend_buffer_name(cur->buffer), "RKNPU", 5) != 0) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {

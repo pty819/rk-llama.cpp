@@ -130,7 +130,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
                 model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                LLM_FFN_SILU, LLM_FFN_PAR, il, model.layers[il].ffn_gate_up_rknpu);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);

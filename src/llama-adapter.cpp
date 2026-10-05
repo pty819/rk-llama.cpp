@@ -332,21 +332,18 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
 
-        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+        auto * buft = model_tensor->buffer ? ggml_backend_buffer_get_type(model_tensor->buffer) : nullptr;
+        bool use_cpu = !buft;
+        for (auto & ex : buft_extra) use_cpu |= ex == buft;
 
-        // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
-        for (auto & ex : buft_extra) {
-            if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
-
-                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                if (!cpu_dev) {
-                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
-                }
-                buft = ggml_backend_dev_buffer_type(cpu_dev);
-
-                break;
+        // Fused base projections keep source metadata without a buffer.
+        if (use_cpu) {
+            LLAMA_LOG_DEBUG("%s: lora for '%s' uses CPU storage\n", __func__, model_tensor->name);
+            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu_dev) {
+                throw std::runtime_error(format("%s: no CPU backend found", __func__));
             }
+            buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
         LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
