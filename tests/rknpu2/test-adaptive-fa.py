@@ -18,6 +18,7 @@ static long long test_pairs = 0;
 static std::map<rknn_tensor_mem*, int> test_native_rows;
 static int test_native_aliases = 0;
 static int test_short_b_oversized = 0;
+static std::atomic<bool> test_fail_run{false};
 static int test_fail_sync = -1;
 static bool test_fail_alloc = false;
 struct Fake {''')
@@ -25,6 +26,7 @@ prefix = prefix.replace('auto *f = new Fake;', '''
     if (test_running) test_late_create++;
     auto *f = new Fake;''')
 prefix = prefix.replace('auto *f=(Fake*)ctx; int M=', '''
+    if(test_fail_run.exchange(false)) return -1;
     test_running = true;
     auto *f=(Fake*)ctx; int M=''')
 prefix = prefix.replace('auto *a=(__fp16*)f->a->virt_addr;', '''
@@ -56,7 +58,7 @@ int main(int argc, char ** argv) {
     const bool adaptive = argc < 2 || strcmp(argv[1], "0") != 0;
     setenv("RKNPU_FA", "1", 1);
     setenv("RKNPU_FA_CPU_FALLBACK", "0", 1);
-    setenv("RKNPU_FA_THREADS", "3", 1);
+    setenv("RKNPU_FA_THREADS", getenv("RKNPU_FA_THREADS_TEST") ? getenv("RKNPU_FA_THREADS_TEST") : "3", 1);
     setenv("RKNPU_FA_MT", "256", 1);
     setenv("RKNPU_FA_MAX_CTX", "6", 1);
     if(argc > 1 && strcmp(argv[1], "unset") == 0) unsetenv("RKNPU_FA_ADAPTIVE");
@@ -91,6 +93,12 @@ int main(int argc, char ** argv) {
         dst.src[0]=&q; dst.src[1]=&k; dst.src[2]=&v; dst.src[3]=mode ? &mask : nullptr; dst.op_params[0]=.125f;
         ggml_tensor expected=dst; expected.data=ref.data();
         rknpu_fa_reference(&expected,&q,&k,&v,dst.src[3],.125f);
+        if(mode==0 && n0==53) {
+            test_fail_run=true;
+            const bool rejected=rknpu_fa_compute(&dst)==GGML_STATUS_FAILED;
+            printf("SDK failure barrier %s\n",rejected?"PASS":"FAIL");
+            failures += !rejected;
+        }
         test_running=false; test_late_create=0; test_pairs=0; test_native_aliases=0; test_short_b_oversized=0;
         int status=rknpu_fa_compute(&dst);
         float err=0; bool finite=true;
@@ -134,5 +142,8 @@ with tempfile.TemporaryDirectory(prefix='rknpu-fa-adaptive-') as tmp:
     cpp.write_text(prefix + fa + main)
     exe = Path(tmp) / 'test'
     subprocess.run([os.getenv('CXX', 'c++'), '-std=c++17', '-O2', '-pthread', '-Wno-unknown-pragmas', '-I', str(include), str(cpp), '-o', str(exe)], check=True)
-    for adaptive in ('1', '0', 'unset'):
-        subprocess.run([str(exe), adaptive], check=True)
+    for threads in os.getenv('FA_POOL_TEST_THREADS', '3').split(','):
+        env = os.environ.copy()
+        env['RKNPU_FA_THREADS_TEST'] = threads
+        for adaptive in ('1', '0', 'unset'):
+            subprocess.run([str(exe), adaptive], env=env, check=True)

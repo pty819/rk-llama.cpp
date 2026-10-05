@@ -17,6 +17,8 @@
 #include <cassert>
 #include <cstring>
 #include <mutex>
+#include <condition_variable>
+#include <exception>
 #include <string>
 #include <vector>
 #include <tuple>
@@ -1153,9 +1155,85 @@ static int rknpu_fa_env(const char * name, int def) { const char* e = std::geten
 
 namespace rkfa {
 static inline int rup(int x, int a) { return (x + a - 1) / a * a; }
+class WorkerPool {
+    std::mutex dispatch_mu, mu;
+    std::condition_variable work, done;
+    std::vector<std::thread> threads;
+    uint64_t generation = 0;
+    size_t pending = 0;
+    bool stopping = false;
+    void (*callback)(void *, int) = nullptr;
+    void * argument = nullptr;
+    std::exception_ptr error;
+
+    void worker(int tid) {
+#if defined(__linux__)
+        pthread_setname_np(pthread_self(), "rknpu-fa");
+#endif
+        uint64_t last = 0;
+        std::unique_lock<std::mutex> lock(mu);
+        for (;;) {
+            work.wait(lock, [&] { return stopping || generation != last; });
+            if (stopping) return;
+            last = generation;
+            auto fn = callback;
+            auto arg = argument;
+            lock.unlock();
+            std::exception_ptr failure;
+            try { fn(arg, tid); } catch (...) { failure = std::current_exception(); }
+            lock.lock();
+            if (failure && !error) error = failure;
+            if (--pending == 0) done.notify_one();
+        }
+    }
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            stopping = true;
+        }
+        work.notify_all();
+        for (auto & thread : threads) thread.join();
+    }
+
+public:
+    explicit WorkerPool(int count) {
+        assert(count > 0);
+        threads.reserve(count);
+        try {
+            for (int tid = 1; tid < count; ++tid) threads.emplace_back([this, tid] { worker(tid); });
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+    ~WorkerPool() { stop(); }
+    WorkerPool(const WorkerPool &) = delete;
+    WorkerPool & operator=(const WorkerPool &) = delete;
+
+    template<typename Function> void run(Function & fn) {
+        std::lock_guard<std::mutex> dispatch_lock(dispatch_mu);
+        std::unique_lock<std::mutex> lock(mu);
+        error = nullptr;
+        callback = [](void * arg, int tid) { (*static_cast<Function *>(arg))(tid); };
+        argument = &fn;
+        pending = threads.size();
+        ++generation;
+        work.notify_all();
+        lock.unlock();
+        std::exception_ptr failure;
+        try { fn(0); } catch (...) { failure = std::current_exception(); }
+        lock.lock();
+        if (failure && !error) error = failure;
+        done.wait(lock, [&] { return pending == 0; });
+        callback = nullptr;
+        argument = nullptr;
+        if (error) std::rethrow_exception(error);
+    }
+};
 struct Ctx { rknn_matmul_ctx ctx = 0; rknn_matmul_info info; rknn_matmul_io_attr io; rknn_tensor_mem *bA = nullptr, *bB = nullptr, *bC = nullptr; uint64_t last = 0; };
 struct Mem { rknn_tensor_mem * m = nullptr; size_t size = 0; rknn_matmul_ctx owner = 0; std::vector<rknn_tensor_mem *> retired; };
 struct TB { Mem q, s, p, o, ks, vs; std::vector<float> inv; std::vector<float32x4_t> mx4, sm4; int rows = 0; std::map<std::pair<int,int>, std::pair<Mem,Mem>> small_kv; };   // ks/vs: K/V rows [k0, k0+Nq) staged for jobs with k0 > 0
+static std::mutex compute_mu;
 static std::mutex mu;
 static std::map<std::tuple<int,int,int,int,int>, Ctx*> ctxs;   // (M, K, N, B layout, slot)
 static Ctx * anyctx = nullptr;
@@ -1321,6 +1399,7 @@ static void rknpu_fa_reference(const ggml_tensor * dst, const ggml_tensor * q, c
 
 static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     using namespace rkfa;
+    std::lock_guard<std::mutex> compute_lock(compute_mu);
     const bool prof = rknpu_prof::enabled();
     if (prof) rknpu_prof::extra_dump = rkfa::dump_prof;
     const double T0 = rknpu_prof::now_ms();
@@ -1473,15 +1552,19 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     const double T2 = rknpu_prof::now_ms();
 
     // ---- 5. driver threads ----
-    std::atomic<int> next{0};
+    static const bool use_pool = [] { const char * e = std::getenv("RKNPU_FA_POOL"); return e && std::atoi(e) != 0; }();
+    std::atomic<int> next{use_pool ? nthr : 0};
     std::atomic<bool> failed{false};
     std::vector<std::array<double, F_N>> tacc(nthr);
     auto worker = [&](int tid) {
         std::array<double, F_N> & ta = tacc[tid]; ta.fill(0.0);
         const float32x4_t ninf = vdupq_n_f32(-INFINITY), zero = vdupq_n_f32(0.f), vs = vdupq_n_f32(scale);
         const int32x4_t lane = {0, 1, 2, 3};
+        bool first_job = true;
         for (;;) {
-            const int ji = next.fetch_add(1);
+            // Give each slot its first job before sharing the remaining work across cores.
+            const int ji = use_pool && first_job ? tid : next.fetch_add(1);
+            first_job = false;
             if (ji >= (int)jobs.size() || failed.load(std::memory_order_relaxed)) break;
             const Job & jb = jobs[ji];
             const int M = ratio * jb.mtp, Nq = jb.Nq;
@@ -1610,7 +1693,18 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             }
         }
     };
-    {
+    if (use_pool) {
+        try {
+            static WorkerPool pool(nthr);
+            pool.run(worker);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "RKNPU FA: worker pool failed: %s\n", e.what());
+            failed = true;
+        } catch (...) {
+            fprintf(stderr, "RKNPU FA: worker pool failed\n");
+            failed = true;
+        }
+    } else {
         std::vector<std::thread> th;
         th.reserve(nthr);
         for (int t = 0; t < nthr; t++) th.emplace_back(worker, t);
