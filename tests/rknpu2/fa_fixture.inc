@@ -11,7 +11,11 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <cassert>
+#include <condition_variable>
+#include <exception>
 #include <thread>
+#include <pthread.h>
 #include <vector>
 #include "rknn_matmul_api.h"
 enum { GGML_TYPE_F32, GGML_TYPE_F16 };
