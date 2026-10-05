@@ -1514,6 +1514,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    auto fuse_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value && std::atoi(value) != 0;
+    };
+    for (size_t il = 0; il < layers.size(); il++) {
+        auto & layer = layers[il];
+        if (arch == LLM_ARCH_QWEN3 && fuse_enabled("RKNPU_FUSE_QKV") && !layer.wqkv && !layer.wq_b && !layer.wk_b && !layer.wv_b && !layer.wq_s && !layer.wk_s && !layer.wv_s) {
+            layer.wqkv_rknpu = ml.create_rknpu_concat(hparams, format("blk.%zu.attn_qkv.rknpu.weight", il), {layer.wq, layer.wk, layer.wv});
+        }
+        if (arch == LLM_ARCH_QWEN3 && fuse_enabled("RKNPU_FUSE_GATE_UP")) {
+            layer.ffn_gate_up_rknpu = ml.create_rknpu_concat(hparams, format("blk.%zu.ffn_gate_up.rknpu.weight", il), {layer.ffn_gate, layer.ffn_up});
+        }
+    }
     ml.done_getting_tensors();
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
@@ -1547,6 +1560,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (ggml_get_first_tensor(ctx) == nullptr) {
             continue;
         }
+
+        ggml_context_ptr allocation_ctx;
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> allocation_tensors;
+        bool has_metadata = false;
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            has_metadata |= ml.metadata_only_weights.count(t->name) != 0;
+        }
+        if (has_metadata) {
+            ggml_init_params params = {ggml_get_mem_size(ctx), nullptr, true};
+            allocation_ctx.reset(ggml_init(params));
+            if (!allocation_ctx) throw std::runtime_error("unable to create projection allocation context");
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                if (ml.metadata_only_weights.count(t->name)) continue;
+                GGML_ASSERT(!t->view_src && !t->data);
+                auto * copy = ggml_dup_tensor(allocation_ctx.get(), t);
+                ggml_set_name(copy, t->name);
+                copy->flags = t->flags;
+                allocation_tensors.emplace_back(t, copy);
+            }
+        }
+        ggml_context * ctx_alloc = allocation_ctx ? allocation_ctx.get() : ctx;
 
         llama_buf_map buf_map;
         buf_map.reserve(n_max_backend_buffer);
@@ -1591,11 +1625,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx_alloc); t != nullptr; t = ggml_get_next_tensor(ctx_alloc, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_alloc, buft); // real buffer
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1618,7 +1652,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
-        pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+        for (const auto & [original, allocated] : allocation_tensors) {
+            original->data = allocated->data;
+            original->buffer = allocated->buffer;
+            original->extra = allocated->extra;
+        }
+        if (allocation_ctx) {
+            pimpl->ctxs_bufs.emplace_back(std::move(allocation_ctx), std::move(bufs));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::vector<ggml_backend_buffer_ptr>{});
+        } else {
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+        }
 
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
@@ -1718,6 +1762,7 @@ llama_split_mode llama_model::split_mode() const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (bufs.empty()) continue;
         if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
