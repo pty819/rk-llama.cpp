@@ -1,3 +1,5 @@
+> Current reliability status: native-B has been removed, CPU PV uses fp32 accumulation, and RKNN errors no longer continue silently. See [the 2026-10-05 reliability notes](reliability-20261005.md).
+
 # Orange Pi 5 (RK3588S) 上的 NPU 加速 embedding：ggml-rknpu2 优化分支
 
 本分支基于 [javer/rk-llama.cpp](https://github.com/javer/rk-llama.cpp)（`b10297-rknpu2`），其 RKNPU2 后端来自

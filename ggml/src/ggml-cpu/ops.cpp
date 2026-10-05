@@ -9078,7 +9078,7 @@ static void fa1_gemm_AT(float * C, int ldc, const float * AT, int ldat, const fl
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 #define GGML_FA_OPT1_F16 1
 // ---- fp16-arithmetic variant (GGML_FA_OPT1=2): K/V used in place from the f16 cache, fp16 FMA (8 lanes) with
-//      short fp16 accumulation chains widened into fp32 (QK: every FA1H_QK_CHUNK k, PV: per kv tile); softmax,
+//      short fp16 QK accumulation chains widened into fp32 every FA1H_QK_CHUNK k; PV accumulates in fp32. Softmax,
 //      running max/sum and the output accumulator stay fp32.
 static int fa1h_qk_chunk(void) {
     static int v = -1;
@@ -9152,29 +9152,31 @@ static inline float32x4_t fa1_expf_fast(float32x4_t x) {
     return vreinterpretq_f32_s32(vaddq_s32(vreinterpretq_s32_f32(p), e));
 }
 
-// C[8 x 16] (fp32) += AT^T * B; AT fp16 [K][ldat] (8 consecutive rows of C per k), B fp16 rows (ldb)
+// C[4 x 16] (fp32) += AT^T * B; AT fp16 [K][ldat], B fp16 rows (ldb).
 static inline void fa1h_ukernel_AT(float * GGML_RESTRICT C, int ldc, const __fp16 * GGML_RESTRICT AT, int ldat,
                                    const __fp16 * GGML_RESTRICT B, int64_t ldb, int K) {
-    float16x8_t c[8][2];
-    for (int i = 0; i < 8; i++) { c[i][0] = vdupq_n_f16(0); c[i][1] = vdupq_n_f16(0); }
+    float32x4_t c[4][4];
+    for (int i = 0; i < 4; i++) for (int r = 0; r < 4; r++) c[i][r] = vdupq_n_f32(0);
     for (int k = 0; k < K; k++) {
-        const float16x8_t a  = vld1q_f16(AT + k*ldat);
-        const float16x8_t b0 = vld1q_f16(B + k*ldb), b1 = vld1q_f16(B + k*ldb + 8);
-#define FA1H_ROW(i) c[i][0] = vfmaq_laneq_f16(c[i][0], b0, a, i); c[i][1] = vfmaq_laneq_f16(c[i][1], b1, a, i);
-        FA1H_ROW(0) FA1H_ROW(1) FA1H_ROW(2) FA1H_ROW(3) FA1H_ROW(4) FA1H_ROW(5) FA1H_ROW(6) FA1H_ROW(7)
+        const float32x4_t a = vcvt_f32_f16(vld1_f16(AT + k*ldat));
+        const float16x8_t bh0 = vld1q_f16(B + k*ldb), bh1 = vld1q_f16(B + k*ldb + 8);
+        const float32x4_t b0 = vcvt_f32_f16(vget_low_f16(bh0)), b1 = vcvt_high_f32_f16(bh0);
+        const float32x4_t b2 = vcvt_f32_f16(vget_low_f16(bh1)), b3 = vcvt_high_f32_f16(bh1);
+#define FA1H_ROW(i) c[i][0] = vfmaq_laneq_f32(c[i][0], b0, a, i); c[i][1] = vfmaq_laneq_f32(c[i][1], b1, a, i); \
+                   c[i][2] = vfmaq_laneq_f32(c[i][2], b2, a, i); c[i][3] = vfmaq_laneq_f32(c[i][3], b3, a, i);
+        FA1H_ROW(0) FA1H_ROW(1) FA1H_ROW(2) FA1H_ROW(3)
 #undef FA1H_ROW
     }
-    for (int i = 0; i < 8; i++) for (int r = 0; r < 2; r++) {
-        float * cp = C + i*ldc + 8*r;
-        vst1q_f32(cp,     vaddq_f32(vld1q_f32(cp),     vcvt_f32_f16(vget_low_f16(c[i][r]))));
-        vst1q_f32(cp + 4, vaddq_f32(vld1q_f32(cp + 4), vcvt_high_f32_f16(c[i][r])));
+    for (int i = 0; i < 4; i++) for (int r = 0; r < 4; r++) {
+        float * cp = C + i*ldc + 4*r;
+        vst1q_f32(cp, vaddq_f32(vld1q_f32(cp), c[i][r]));
     }
 }
 
-// C[M x N] += AT^T[M x K] * B[K x N]; M % 8 == 0, N % 16 == 0
+// C[M x N] += AT^T[M x K] * B[K x N]; M % 4 == 0, N % 16 == 0
 static void fa1h_gemm_AT(float * C, int ldc, const __fp16 * AT, int ldat, const __fp16 * B, int64_t ldb, int M, int N, int K) {
     for (int j = 0; j < N; j += 16) {
-        for (int i = 0; i < M; i += 8) {
+        for (int i = 0; i < M; i += 4) {
             fa1h_ukernel_AT(C + i*ldc + j, ldc, AT + i, ldat, B + j, ldb, K);
         }
     }

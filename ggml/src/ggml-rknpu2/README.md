@@ -1,3 +1,5 @@
+> Current reliability status: native-B has been removed, CPU PV uses fp32 accumulation, and RKNN errors no longer continue silently. See [the reliability notes](../../../docs/opi5/reliability-20261005.md).
+
 # rk-llama.cpp
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
