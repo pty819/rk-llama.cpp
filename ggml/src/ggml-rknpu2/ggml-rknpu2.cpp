@@ -1234,7 +1234,7 @@ public:
 };
 struct Ctx { rknn_matmul_ctx ctx = 0; rknn_matmul_info info; rknn_matmul_io_attr io; rknn_tensor_mem *bA = nullptr, *bB = nullptr, *bC = nullptr; uint64_t last = 0; };
 struct Mem { rknn_tensor_mem * m = nullptr; size_t size = 0; rknn_matmul_ctx owner = 0; std::vector<rknn_tensor_mem *> retired; };
-struct TB { Mem q, s, p, o, ks, vs; std::vector<float> inv; std::vector<float32x4_t> mx4, sm4; int rows = 0; std::map<std::pair<int,int>, std::pair<Mem,Mem>> small_kv; };   // ks/vs: K/V rows [k0, k0+Nq) staged for jobs with k0 > 0
+struct TB { Mem q, s, o, ks, vs; std::vector<float> inv; std::vector<float32x4_t> mx4, sm4; int rows = 0; std::map<std::pair<int,int>, std::pair<Mem,Mem>> small_kv; };   // s: fp16 S, overwritten in place by P (QK C layout == PV A layout); ks/vs: K/V rows [k0, k0+Nq) staged for jobs with k0 > 0
 static std::mutex compute_mu;
 static std::mutex mu;
 static std::map<std::tuple<int,int,int,int,int,int>, Ctx*> ctxs;   // (M, K, N, type, B layout, slot)
@@ -1589,7 +1589,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
         if (tbs[t].rows == 0) tbs[t].rows = (int)M;
         TB & b = tbs[t].rows == (int)M ? tbs[t] : shaped_tbs[t][(int)M];
         b.rows = (int)M;
-        if (!ensure(b.q, M * D * 2) || !ensure(b.s, M * Nq * 2) || !ensure(b.p, M * Nq * 2) || !ensure(b.o, M * D * 4)) return GGML_STATUS_FAILED;
+        if (!ensure(b.q, M * D * 2) || !ensure(b.s, M * Nq * 2) || !ensure(b.o, M * D * 4)) return GGML_STATUS_FAILED;
         if ((kskip || nat) && (!ensure(b.ks, Nq * D * 2) || !ensure(b.vs, Nq * D * 2))) return GGML_STATUS_FAILED;
         b.inv.resize(M); b.mx4.resize(M); b.sm4.resize(M);
     }
@@ -1713,7 +1713,9 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 if (rknn_mem_sync(cq->ctx, ks.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0 || rknn_mem_sync(cq->ctx, vs.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
                 kb = ks.m; vb = vs.m;
             }
-            if (!bind(cq, b.q.m, kb, b.s.m, nat) || !bind(cv, b.p.m, vb, b.o.m, nat)) { failed = true; break; }
+            // S and P share one buffer: the fp16-out QK C layout (Nq/8, M, 8) is element-identical to the PV
+            // A layout (K/8, M, 8) with K = Nq, so the softmax rewrites S in place and PV reads it back as A.
+            if (!bind(cq, b.q.m, kb, b.s.m, nat) || !bind(cv, b.s.m, vb, b.o.m, nat)) { failed = true; break; }
             double t2 = prof ? rknpu_prof::now_ms() : 0;
             if (rknn_matmul_run(cq->ctx) < 0) { failed = true; break; }
             double t3 = prof ? rknpu_prof::now_ms() : 0;
@@ -1723,7 +1725,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
             // QK runs RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16 (probed 1.72x faster than the fp32-out variant on
             // RK3588, C-write bandwidth halves); logits carry enough fp16 significand at attention scale
             // (probe: max err 0 vs fp32-out on QK shapes). Max/exp stay in fp32 NEON after an f16->f32 widen.
-            const __fp16 * S = (const __fp16 *)b.s.m->virt_addr; __fp16 * P = (__fp16 *)b.p.m->virt_addr;
+            const __fp16 * S = (const __fp16 *)b.s.m->virt_addr; __fp16 * P = (__fp16 *)b.s.m->virt_addr;   // in-place: P overwrites S
             // Each job scans new logits; mx4 holds the previous job's softmax offset.
             for (int r = 0; r < M; r++) b.mx4[r] = ninf;
             auto row_tok = [&](int r, int & t) -> bool { const int i = r % jb.mtp; t = jb.r0 + i; return i < jb.mtc; };
@@ -1791,7 +1793,7 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                 b.inv[r] = sum > 0 ? (float)(1.0 / sum) : 0.f;
             }
             double t3d = prof ? rknpu_prof::now_ms() : 0;
-            if (rknn_mem_sync(cv->ctx, b.p.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
+            if (rknn_mem_sync(cv->ctx, b.s.m, RKNN_MEMORY_SYNC_TO_DEVICE) < 0) { failed = true; break; }
             double t4 = prof ? rknpu_prof::now_ms() : 0;
             if (rknn_matmul_run(cv->ctx) < 0) { failed = true; break; }
             double t5 = prof ? rknpu_prof::now_ms() : 0;
