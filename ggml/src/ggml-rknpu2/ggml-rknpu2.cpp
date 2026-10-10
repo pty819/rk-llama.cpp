@@ -1651,7 +1651,10 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
     const double T2 = rknpu_prof::now_ms();
 
     // ---- 5. driver threads ----
-    static const bool use_pool = [] { const char * e = std::getenv("RKNPU_FA_POOL"); return !e || std::atoi(e) != 0; }();
+    // Pool default OFF (reverted 2026-10-10): measured on-device, the persistent FA pool costs short requests
+    // ~42% wall (3.52s -> 2.05s at 525 tok, thread CPU 23.2s -> 12.6s) and buys nothing on long ones (-3%, noise).
+    // Per-node std::thread spawn+join is the cheaper structure here.
+    static const bool use_pool = [] { const char * e = std::getenv("RKNPU_FA_POOL"); return e && std::atoi(e) != 0; }();
     std::atomic<int> next{use_pool ? nthr : 0};
     std::atomic<bool> failed{false};
     std::vector<std::array<double, F_N>> tacc(nthr);
