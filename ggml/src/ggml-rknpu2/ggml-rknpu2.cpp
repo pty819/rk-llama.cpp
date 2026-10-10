@@ -1,3 +1,4 @@
+
 #include "ggml-rknpu2.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -1417,6 +1418,33 @@ inline static float32x4_t v_expf(float32x4_t x) {   // same as ggml_v_expf
                      vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)));
 }
 enum { F_MASK, F_GATHER, F_QFILL, F_BIND, F_RUNQK, F_SSYNC, F_SMAX, F_SEXP, F_GEN, F_PSYNC, F_RUNPV, F_OUT, F_N };
+// Fast path exp for the FA softmax: f32 range reduction (exact - x = s*scale - m must NOT be
+// rounded through fp16, its step near -8 alone would cost ~0.2% relative), then only r in
+// [-0.347, 0.347] narrows to fp16 for a 5-term Taylor Horner, and 2^n is built straight into
+// fp16 exponent/subnormal bits. On-device probe (A76): avg_rel 4.3e-4 / max_rel 1.4e-3 on the
+// softmax-dense distribution, 11.4x the f32 polynomial; both sit on the fp16 storage floor.
+// n < -24 (x < -16.6) flushes to zero, which is the softmax tail's own semantics.
+inline static float16x8_t v_exp8_f16(float32x4_t x0, float32x4_t x1) {
+    const float32x4_t inv_ln2 = vdupq_n_f32(1.44269504088896f);
+    const float32x4_t ln2 = vdupq_n_f32(0.693147180559945f);
+    float32x4_t y0 = vmulq_f32(x0, inv_ln2), y1 = vmulq_f32(x1, inv_ln2);
+    int32x4_t n0 = vcvtnq_s32_f32(y0), n1 = vcvtnq_s32_f32(y1);
+    float32x4_t r0 = vfmsq_f32(x0, vcvtq_f32_s32(n0), ln2), r1 = vfmsq_f32(x1, vcvtq_f32_s32(n1), ln2);
+    float16x8_t r = vcombine_f16(vcvt_f16_f32(r0), vcvt_f16_f32(r1));
+    int16x8_t n = vcombine_s16(vmovn_s32(n0), vmovn_s32(n1));
+    const float16x8_t a5 = vdupq_n_f16(1.0f/120), a4 = vdupq_n_f16(1.0f/24), a3 = vdupq_n_f16(1.0f/6), a2 = vdupq_n_f16(0.5f);
+    float16x8_t p = a5;
+    p = vfmaq_f16(a4, r, p);
+    p = vfmaq_f16(a3, r, p);
+    p = vfmaq_f16(a2, r, p);
+    p = vfmaq_f16(vdupq_n_f16(1.0f), r, p);   // c1 = 1
+    p = vfmaq_f16(vdupq_n_f16(1.0f), r, p);   // c0 = 1
+    int16x8_t bits = vshlq_n_s16(vmaxq_s16(vaddq_s16(n, vdupq_n_s16(15)), vdupq_n_s16(0)), 10);
+    int16x8_t sub = vshlq_s16(vdupq_n_s16(1), vmaxq_s16(vaddq_s16(n, vdupq_n_s16(24)), vdupq_n_s16(0)));
+    uint16x8_t msub = vcltq_s16(n, vdupq_n_s16(-14)), mz = vcltq_s16(n, vdupq_n_s16(-24));
+    bits = vbslq_s16(msub, sub, bits);
+    return vmulq_f16(p, vreinterpretq_f16_s16(vbslq_s16(mz, vdupq_n_s16(0), bits)));
+}
 static double ft[F_N]; static long f_n = 0; static double f_wall = 0; static double f_cols = 0, f_cols_noskip = 0, f_pairs = 0;
 static const char * fname[F_N] = {"mask scan (wall)", "K/V gather+sync (wall)", "Q fill+sync (thr)", "bind+B fill (thr)", "run QK (thr)",
                                   "S sync (thr)", "softmax max (thr)", "softmax exp+P (thr)", "softmax generic (thr)", "P sync (thr)",
@@ -1761,6 +1789,20 @@ static enum ggml_status rknpu_fa_compute(const ggml_tensor * dst) {
                     if (!valid || !row_clean[t] || j0 > row_hi[t] - k0 || j0 + 7 < row_lo[t] - k0) { vst1q_f16(Pb + (size_t)r * 8, vdupq_n_f16(0)); continue; }
                     const int lo = row_lo[t] - k0, hi = row_hi[t] - k0;
                     const float16x8_t s8 = vld1q_f16(Sb + (size_t)r * 8);
+                    float16x8_t e8;
+                    static const bool fast_exp = [] { const char * e = std::getenv("RKNPU_FA_FAST_EXP"); return e && std::atoi(e) != 0; }();
+                    if (fast_exp) {
+                        e8 = v_exp8_f16(vfmaq_f32(b.mx4[r], vcvt_f32_f16(vget_low_f16(s8)), vs),
+                                        vfmaq_f32(b.mx4[r], vcvt_f32_f16(vget_high_f16(s8)), vs));
+                        if (j0 < lo || j0 + 7 > hi) {
+                            const int16x8_t j8 = vaddq_s16(vdupq_n_s16(j0), (int16x8_t) {0,1,2,3,4,5,6,7});
+                            e8 = vbslq_f16(vandq_u16(vcgeq_s16(j8, vdupq_n_s16(lo)), vcleq_s16(j8, vdupq_n_s16(hi))), e8, vdupq_n_f16(0.f));
+                        }
+                        // sum accumulates the exact fp16 values PV will read (numerator/denominator consistency)
+                        b.sm4[r] = vaddq_f32(b.sm4[r], vaddq_f32(vcvt_f32_f16(vget_low_f16(e8)), vcvt_f32_f16(vget_high_f16(e8))));
+                        vst1q_f16(Pb + (size_t)r * 8, e8);
+                        continue;
+                    }
                     float32x4_t e0 = v_expf(vfmaq_f32(b.mx4[r], vcvt_f32_f16(vget_low_f16(s8)), vs));
                     float32x4_t e1 = v_expf(vfmaq_f32(b.mx4[r], vcvt_f32_f16(vget_high_f16(s8)), vs));
                     if (j0 < lo || j0 + 7 > hi) {

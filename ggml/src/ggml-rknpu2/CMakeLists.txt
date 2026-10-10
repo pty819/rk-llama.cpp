@@ -32,3 +32,9 @@ if(OpenMP_FOUND)
     target_compile_options(ggml-rknpu2 PRIVATE ${OpenMP_CXX_FLAGS})
     target_link_libraries(ggml-rknpu2 PRIVATE ${OpenMP_CXX_FLAGS})
 endif()
+
+# RK3588-only backend: the FA softmax and quantization kernels use ARMv8.2-A FP16
+# arithmetic (FMLA.8H); same pattern as the official aarch64 ggml-cpu march flags.
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    target_compile_options(ggml-rknpu2 PRIVATE -march=armv8.2-a+fp16)
+endif()
