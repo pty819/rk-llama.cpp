@@ -2,20 +2,121 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf, logger
+from .base import MmprojModel, ModelBase, ModelType, TextModel, get_model_architecture, gguf, logger
 
 from .granite import GraniteHybridModel
+from .qwen import DFlashModel
+
+
+@ModelBase.register("LiLiCorrDraftModel")
+class LiLiCorrDraftModel(DFlashModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        prefix = "model.lilicorr."
+        if not any(name.startswith(prefix) for name in self.model_tensors):
+            raise ValueError("no lilicorr.* tensors found")
+        dflash_config = self.hparams["dflash_config"]
+        self.lilicorr_geometry = {
+            "hidden_size": int(dflash_config["lilicorr_hidden_size"]),
+            "candidate_topk": int(dflash_config["lilicorr_candidate_topk"]),
+            "num_heads": int(dflash_config["lilicorr_num_heads"]),
+            "num_layers": int(dflash_config["lilicorr_num_layers"]),
+            "factor_dim": int(dflash_config["lilicorr_factor_dim"]),
+            "mlp_hidden_size": self.model_tensors[prefix + "layers.0.mlp.up_proj.weight"]().shape[0],
+        }
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count + self.lilicorr_geometry["num_layers"] + 1)
+        block = int(dflash_config.get("block_size", self.hparams.get("block_size", 16)))
+        topk = self.lilicorr_geometry["candidate_topk"]
+        heads = self.lilicorr_geometry["num_heads"]
+        nodes = (block - 1) * topk
+        relative = gguf.LazyBase.to_eager(self.model_tensors.pop(prefix + "relative_slot_bias")()).float().cpu().numpy()
+        same = gguf.LazyBase.to_eager(self.model_tensors.pop(prefix + "same_slot_bias")()).float().cpu().numpy()
+        bias = np.empty((heads, nodes, nodes), dtype=np.float32)
+        for q in range(nodes):
+            q_slot = q // topk
+            for k in range(nodes):
+                k_slot = k // topk
+                bias[:, q, k] = relative[:, q_slot - k_slot + block - 1]
+                if q_slot == k_slot:
+                    bias[:, q, k] += same
+        self.model_tensors[prefix + "attention_bias.bias"] = lambda bias=bias: torch.from_numpy(bias)
+        for name in ("slot_embedding", "rank_embedding"):
+            gen = self.model_tensors.pop(prefix + name)
+            self.model_tensors[prefix + name + ".weight"] = lambda gen=gen: gen().reshape(-1, self.lilicorr_geometry["hidden_size"])
+        for i in range(self.lilicorr_geometry["num_layers"]):
+            layer_prefix = prefix + f"layers.{i}.attn.in_proj"
+            for suffix in ("weight", "bias"):
+                self.model_tensors[layer_prefix + "." + suffix] = self.model_tensors.pop(layer_prefix + "_" + suffix)
+        dflash_config["selector_rank"] = 0
+        dflash_config["selector_top_k"] = 0
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError("LiLiCorr draft requires --target-model-dir")
+        from . import get_model_class
+        target_text_config = ModelBase.load_hparams(self.target_model_dir, False)
+        target_text_config = {**target_text_config, **target_text_config.get("text_config", {})}
+        target_arch = get_model_architecture(target_text_config, ModelType.TEXT)
+        target_cls = get_model_class(target_arch)
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
+        try:
+            if target_arch == "NemotronHForCausalLM":
+                self.is_moe = "num_experts_per_tok" in target_text_config
+            target_cls.set_vocab(self)  # ty: ignore[unresolved-attribute]
+        finally:
+            self.dir_model = original_dir
+        self.gguf_writer.add_mask_token_id(self.hparams["dflash_config"]["mask_token_id"])
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        dflash_config = self.hparams["dflash_config"]
+        self.gguf_writer.add_lilicorr_hidden_size(int(self.lilicorr_geometry["hidden_size"]))
+        self.gguf_writer.add_lilicorr_candidate_topk(int(self.lilicorr_geometry["candidate_topk"]))
+        self.gguf_writer.add_lilicorr_num_heads(int(self.lilicorr_geometry["num_heads"]))
+        self.gguf_writer.add_lilicorr_num_layers(int(self.lilicorr_geometry["num_layers"]))
+        self.gguf_writer.add_lilicorr_factor_dim(int(self.lilicorr_geometry["factor_dim"]))
+        self.gguf_writer.add_lilicorr_mlp_hidden_size(int(self.lilicorr_geometry["mlp_hidden_size"]))
+        self.gguf_writer.add_lilicorr_vector_eps(float(dflash_config["lilicorr_vector_eps"]))
+        self.gguf_writer.add_lilicorr_logit_scale(float(dflash_config["lilicorr_logit_scale"]))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("model.lilicorr."):
+            if name.startswith("model.lilicorr.layers."):
+                parts = name.split(".", 4)
+                if not parts[4].startswith("attn.in_proj."):
+                    parts[3] = str(self.block_count + int(parts[3]))
+                name = ".".join(parts)
+            elif name.startswith("model.lilicorr.feature_norm."):
+                feature_bid = self.block_count + self.lilicorr_geometry["num_layers"]
+                name = name.replace("model.lilicorr.feature_norm.", f"model.lilicorr.feature_mlp.{feature_bid}.norm.")
+            elif name.startswith("model.lilicorr.feature_mlp."):
+                feature_bid = self.block_count + self.lilicorr_geometry["num_layers"]
+                name = name.replace("model.lilicorr.feature_mlp.", f"model.lilicorr.feature_mlp.{feature_bid}.")
+            yield self.map_tensor_name(name), data_torch
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if name.startswith("model.lilicorr."):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
 @ModelBase.register(
     "NemotronH_Nano_VL_V2",
     "RADIOModel",
 )
+@ModelBase.example("nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16")
 class NemotronNanoV2VLModel(MmprojModel):
     # ViT-Huge architecture parameters for RADIO v2.5-h
     _vit_hidden_size = 1280
@@ -151,6 +252,7 @@ class NemotronNanoV2VLModel(MmprojModel):
 
 
 @ModelBase.register("NemotronForCausalLM")
+@ModelBase.example("nvidia/Minitron-4B-Base")
 class NemotronModel(TextModel):
     model_arch = gguf.MODEL_ARCH.NEMOTRON
 
@@ -193,26 +295,38 @@ class NemotronModel(TextModel):
 
 
 @ModelBase.register("NemotronHForCausalLM")
+@ModelBase.example("nvidia/Nemotron-H-8B-Base-8K")
 class NemotronHModel(GraniteHybridModel):
     """Hybrid mamba2/attention model from NVIDIA"""
     model_arch = gguf.MODEL_ARCH.NEMOTRON_H
     is_moe: bool = False
+    supports_mtp_export = True
+    _experts: list[dict[str, Tensor]] | None = None
+
+    _SSM_LAYER_TYPES = {"mamba", "linear_attention"}
+    _ATTN_LAYER_TYPES = {"attention", "full_attention"}
+    _MLP_LAYER_TYPES = {"moe"}
 
     def __init__(self, *args, **kwargs):
         # We have to determine the correct model architecture (MoE vs non-MoE) before
         # calling the parent __init__. This is because the parent constructor
         # uses self.model_arch to build the tensor name map, and all MoE-specific
         # mappings would be missed if it were called with the default non-MoE arch.
-        hparams = ModelBase.load_hparams(args[0], self.is_mistral_format)
-        has_moe_params = (
-            "num_experts_per_tok" in hparams
-            or (isinstance(hparams.get("llm_config"), dict) and "num_experts_per_tok" in hparams["llm_config"])
-        )
+        hparams = kwargs.pop("hparams", None)
+        if hparams is None:
+            hparams = ModelBase.load_hparams(args[0], self.is_mistral_format)
+        llm_config = {**hparams, **hparams.get("text_config", {})}
+
+        has_moe_params = "num_experts_per_tok" in llm_config
+        layers_block_type = llm_config.get("layers_block_type")
+
         if has_moe_params:
             self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
             self.is_moe = True
+        if layers_block_type is not None:
+            hparams["num_hidden_layers"] = len(layers_block_type)
 
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, hparams=hparams, **kwargs)
 
         # Save the top-level head_dim for later
         self.head_dim = self.hparams.get("head_dim", self.hparams.get("attention_head_dim"))
@@ -233,8 +347,27 @@ class NemotronHModel(GraniteHybridModel):
             self._ssm_layers = [i for i, val in enumerate(pattern) if val == "M"]
             self._mlp_layers = [i for i, val in enumerate(pattern) if val == ("E" if self.is_moe else "-")]
         else:
-            self._ssm_layers = [i for i, val in enumerate(pattern) if val == "mamba"]
-            self._mlp_layers = [i for i, val in enumerate(pattern) if val == "moe"]
+            self._ssm_layers = [i for i, val in enumerate(pattern) if val in self._SSM_LAYER_TYPES]
+            self._mlp_layers = [i for i, val in enumerate(pattern) if val in self._MLP_LAYER_TYPES]
+
+        # `--no-mtp` drops it entirely; `--mtp` exports only the MTP head
+        self._mtp_bid: int | None = None
+        if self.is_moe and not self.no_mtp:
+            n_nextn = self.hparams.get("num_nextn_predict_layers", 0) or 0
+            if n_nextn > 0:
+                assert n_nextn == 1, (
+                    "NemotronH MTP conversion currently supports num_nextn_predict_layers == 1"
+                )
+                self._mtp_bid = self.block_count
+                self.block_count += 1
+                # The folded MTP block carries both an attention sub-layer and a
+                # MoE sub-layer, so register it as both so the per-layer metadata arrays cover it
+                self._attn_layers.append(self._mtp_bid)
+                self._mlp_layers.append(self._mtp_bid)
+                self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        if self.mtp_only and self._mtp_bid is None:
+            raise ValueError("--mtp was requested, but this model does not contain a supported MTP head")
 
     def get_attn_layers(self):
         pattern = self.hparams.get("hybrid_override_pattern") or self.hparams.get("layers_block_type")
@@ -244,7 +377,49 @@ class NemotronHModel(GraniteHybridModel):
         if isinstance(pattern, str):
             return [i for i, val in enumerate(pattern) if val == "*"]
 
-        return [i for i, val in enumerate(pattern) if val == "attention"]
+        return [i for i, val in enumerate(pattern) if val in self._ATTN_LAYER_TYPES]
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.startswith("mtp."):
+            # --no-mtp: drop the MTP head entirely
+            if cls.no_mtp:
+                return None
+        elif cls.mtp_only:
+            # --mtp: export the MTP head plus the tensors it shares with the target model
+            # Include lm_head scale sidecars so NVFP4 packing sees them.
+            keep = name in (
+                "backbone.embeddings.weight",
+                "backbone.norm_f.weight",
+                "lm_head.weight",
+                "lm_head.weight_scale",
+                "lm_head.weight_scale_2",
+                "lm_head.weight_scale_inv",
+                "lm_head.input_scale",
+                "lm_head.input_global_scale",
+                "lm_head.weight_global_scale",
+                "lm_head.weight_packed",
+            )
+            if not keep:
+                return None
+        # PEFT names adapter tensors using model.layers.*, while Nemotron-H checkpoints
+        # and the GGUF tensor map use backbone.layers.*
+        if name.startswith("model.layers.") and ".mixer." in name:
+            name = name.replace("model.layers.", "backbone.layers.", 1)
+        return super().filter_tensors((name, gen))
+
+    def prepare_metadata(self, vocab_only: bool):
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)
+
+        if not self.mtp_only or not from_dir:
+            return
+        output_type: str = self.ftype.name.partition("_")[2]
+        fname_default: str = gguf.naming_convention(
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)
+        self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -283,6 +458,10 @@ class NemotronHModel(GraniteHybridModel):
 
             if (latent_size := self.hparams.get("moe_latent_size")) is not None:
                 self.gguf_writer.add_moe_latent_size(latent_size)
+
+        # MTP head: number of trailing NextN blocks
+        if self._mtp_bid is not None:
+            self.gguf_writer.add_nextn_predict_layers(self.hparams["num_nextn_predict_layers"])
 
     def set_vocab(self):
         # The NemotronH config uses pattern characters (e.g. '-') that may not
@@ -344,21 +523,24 @@ class NemotronHModel(GraniteHybridModel):
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
         special_vocab.add_to_gguf(self.gguf_writer)
 
-        # The tokenizer _does_ add a BOS token (via post_processor type
-        # TemplateProcessing) but does not set add_bos_token to true in the
-        # config, so we need to explicitly override it here.
-        if not self.is_moe:
-            self.gguf_writer.add_add_bos_token(True)
+    _MTP_SPECIAL_RENAMES = {
+        "mtp.layers.0.enorm.weight":           "model.layers.{bid}.enorm.weight",
+        "mtp.layers.0.hnorm.weight":           "model.layers.{bid}.hnorm.weight",
+        "mtp.layers.0.eh_proj.weight":         "model.layers.{bid}.eh_proj.weight",
+        "mtp.layers.1.norm.weight":            "model.layers.{bid}.post_attention_layernorm.weight",
+        "mtp.layers.1.final_layernorm.weight": "model.layers.{bid}.shared_head.norm.weight",
+    }
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if self.is_moe and bid is not None:
-            # Skip Multi-Token Prediction (MTP) tensors. These are used for
-            # for speculative decoding but we don't include them in this model
-            # conversion. See https://github.com/ggml-org/llama.cpp/pull/18886
-            if name.startswith("mtp."):
-                logger.info(f"gguf: Skipping MTP (Speculative) layer: {name}")
-                return
+        #   mtp.layers.0: NextN input fusion + attention
+        #   mtp.layers.1: MoE + final head norm
+        if self._mtp_bid is not None and name.startswith(("mtp.layers.0.", "mtp.layers.1.")):
+            suffix = name.split(".", 3)[3]
+            bid = self._mtp_bid
+            renamed = self._MTP_SPECIAL_RENAMES.get(name)
+            name = renamed.format(bid=bid) if renamed else f"backbone.layers.{bid}.{suffix}"
 
+        if self.is_moe and bid is not None:
             if name.endswith("mixer.gate.e_score_correction.bias"):
                 yield from ModelBase.modify_tensors(self, data_torch, name, bid)
                 return
@@ -426,3 +608,88 @@ class NemotronHModel(GraniteHybridModel):
             experts = [k for d in self._experts for k in d.keys()]
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
+
+
+@ModelBase.register("NemotronHPuzzleForCausalLM")
+@ModelBase.example("nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16")
+class NemotronHPuzzleModel(NemotronHModel):
+    """NVIDIA Puzzle: NemotronH with a per-block MoE config (block_configs).
+
+    The checkpoint also ships an MTP draft head (mtp.safetensors). It is skipped
+    here: there is no Puzzle MTP inference path in tree, and the head is laid out
+    by mtp_block_configs rather than the mtp.layers.* form NemotronHModel maps."""
+
+    model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
+    is_moe: bool = True
+    supports_mtp_export = False
+
+    def __init__(self, dir_model: "Path", *args, **kwargs):
+        hparams = dict(kwargs.pop("hparams", None) or ModelBase.load_hparams(dir_model, self.is_mistral_format))
+
+        self.block_configs: list[dict] = hparams["block_configs"]
+        self.n_layer_trunk = len(self.block_configs)
+
+        # block_configs carries the per-block MoE shape, and is the authority on the
+        # block pattern too: the layers_block_type the HF config wrapper computes is
+        # not sized to it.
+        hparams["num_hidden_layers"] = self.n_layer_trunk
+        hparams["layers_block_type"] = [bc["block_type"] for bc in self.block_configs]
+
+        self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
+
+        # Bypass NemotronHModel.__init__: it assumes a flat num_experts_per_tok /
+        # moe_intermediate_size and a layers_block_type sized to block_count, neither
+        # of which hold for Puzzle's per-block config.
+        GraniteHybridModel.__init__(self, dir_model, *args, hparams=hparams, **kwargs)
+
+        self.head_dim = self.find_hparam(["head_dim", "attention_head_dim"])
+        self.d_inner = self.find_hparam(["num_heads"]) * self.d_model
+
+        # NemotronHModel.__init__ folds an MTP block into block_count when the
+        # config carries num_nextn_predict_layers; Puzzle's config does, but its
+        # head has a different layout and no inference path, so stay opted out.
+        self._mtp_bid = None
+
+    def set_gguf_parameters(self):
+        GraniteHybridModel.set_gguf_parameters(self)
+
+        head_dim = self.head_dim
+        if head_dim is None:
+            raise ValueError("Could not find the attention head dim in config")
+        self.gguf_writer.add_key_length(head_dim)
+        self.gguf_writer.add_value_length(head_dim)
+
+        ffn_lengths = [bc.get("moe_intermediate_size") or 0 for bc in self.block_configs]
+        experts_used = [bc.get("num_experts_per_tok") or 0 for bc in self.block_configs]
+
+        self.gguf_writer.add_feed_forward_length(ffn_lengths)
+        self.gguf_writer.add_expert_feed_forward_length(ffn_lengths)
+        self.gguf_writer.add_expert_used_count(experts_used)
+
+        self.gguf_writer.add_expert_shared_feed_forward_length(self.hparams["moe_shared_expert_intermediate_size"])
+        self.gguf_writer.add_expert_count(self.hparams["n_routed_experts"])
+        self.gguf_writer.add_expert_shared_count(self.hparams["n_shared_experts"])
+        self.gguf_writer.add_expert_weights_norm(self.hparams["norm_topk_prob"])
+        self.gguf_writer.add_expert_weights_scale(self.hparams["routed_scaling_factor"])
+        self.gguf_writer.add_expert_group_count(self.hparams["n_group"])
+        self.gguf_writer.add_moe_latent_size(self.hparams["moe_latent_size"])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # The official BF16 checkpoint (NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16)
+        # names the trunk "model.*" (model.layers.*, model.embeddings, model.norm_f)
+        # where the original release used the NemotronH-style "backbone.*", and spells
+        # the router bias "e_score_correction_bias" instead of "e_score_correction.bias";
+        # normalize so both convert identically.
+        if name.startswith("model."):
+            name = "backbone." + name[len("model."):]
+        if name.endswith("mixer.gate.e_score_correction_bias"):
+            name = name[: -len("e_score_correction_bias")] + "e_score_correction.bias"
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # Drop the MTP head unconditionally; see the class docstring.
+        if item[0].startswith("mtp."):
+            return None
+        return super().filter_tensors(item)

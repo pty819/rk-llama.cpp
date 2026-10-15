@@ -11,6 +11,7 @@ from .base import ModelBase, TextModel, gguf, logger
 
 
 @ModelBase.register("MellumForCausalLM")
+@ModelBase.example("JetBrains/Mellum2-12B-A2.5B-Base")
 class MellumModel(TextModel):
     model_arch = gguf.MODEL_ARCH.MELLUM
 
@@ -27,6 +28,9 @@ class MellumModel(TextModel):
             logger.info(f"gguf: sliding window = {sliding_window}")
             self.gguf_writer.add_sliding_window_pattern([t == "sliding_attention" for t in self.hparams["layer_types"]])
             logger.info(f"gguf: sliding window pattern length = {len(self.hparams['layer_types'])}")
+
+        if (norm_topk_prob := self.hparams.get("norm_topk_prob")) is not None:
+            self.gguf_writer.add_expert_weights_norm(norm_topk_prob)
 
     _experts: list[dict[str, Tensor]] | None = None
 

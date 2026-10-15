@@ -2936,9 +2936,11 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
     static const struct ggml_backend_buffer_type_i rknpu_buffer_type_interface = {
         /* .get_name       = */ ggml_backend_rknpu_buffer_type_get_name,
         /* .alloc_buffer   = */ ggml_backend_rknpu_buffer_type_alloc_buffer,
+        /* .alloc_buffer_n = */ NULL,
         /* .get_alignment  = */ ggml_backend_rknpu_buffer_type_get_alignment,
         /* .get_max_size   = */ NULL,
         /* .get_alloc_size = */ ggml_backend_rknpu_buffer_type_get_alloc_size,
+        /* .get_alloc_size_n = */ NULL,
         /* .is_host        = */ [](ggml_backend_buffer_type_t buft) { UNUSED(buft); return rknpu_host_compute(); },
     };
 
