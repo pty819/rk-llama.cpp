@@ -449,14 +449,12 @@ struct ggml_backend_rknpu_context {
     // RKNN matmul contexts cache (tensor_fd, offset, M, K, N, core_id, type, domain_id)
     std::unordered_map<std::tuple<uintptr_t, size_t, int, int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
     uint64_t mctx_tick = 0;
-    // Cache is keyed by M_op = next_pow2(n_tokens): every distinct token-count
-    // bucket mints a full family (~588 ctxs) that was never evicted, pinning
-    // ~2 4KB DMA-BUF fds per ctx inside librknnrt forever -> fd table + CMA
-    // exhaustion on long-running servers. Bound it with LRU eviction; live
-    // graphs keep their shared_ptr refs, eviction only drops the cache's ref.
+    // One context family per M bucket (32, 128, 256), about 588 contexts each.
+    // Three families fit under the cap, so a live server does not recreate them.
+    // LRU remains only as a bound if some other M is requested.
     static size_t mctx_cap() {
         static const size_t c = [](){ const char* e = std::getenv("RKNPU_MAX_MCTX");
-                                      return e && std::atoll(e) > 0 ? (size_t)std::atoll(e) : 1800; }();
+                                      return e && std::atoll(e) > 0 ? (size_t)std::atoll(e) : 2048; }();
         return c;
     }
 
@@ -620,12 +618,22 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     return mem_shared;
 }
 
-// Env-tunable M tiling: large batches are split into tiles of at most RKNPU_M_TILE rows
-// (the tail tile is padded to the next power of two). Bounds matmul-context count/creation
-// cost and avoids up to ~2x NPU work from padding M to the next power of two.
+// Weight matmul contexts exist for three M buckets: 32, 128 and 256.
+// Measured run time is flat from M=1 through 32, so the small bucket is 32.
+// A tile is rounded up to the smallest bucket that holds it. RKNPU_M_TILE still
+// splits a long batch; it is clamped to 256, the largest bucket.
 static int rknpu_m_tile() {
-    static int t = [](){ const char* v = std::getenv("RKNPU_M_TILE"); return v ? std::atoi(v) : 256; }();
+    static int t = [](){
+        const char* v = std::getenv("RKNPU_M_TILE");
+        int n = v && std::atoi(v) > 0 ? std::atoi(v) : 256;
+        return n > 256 ? 256 : n;
+    }();
     return t;
+}
+static int rknpu_m_bucket(int Mt) {
+    if (Mt <= 32) return 32;
+    if (Mt <= 128) return 128;
+    return 256;
 }
 
 // Fast int8 row quantization (symmetric, per-row scale), NEON with round-to-nearest
@@ -935,7 +943,7 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
         const int m_tile = rknpu_m_tile() > 0 ? rknpu_m_tile() : M;
         if (rknpu_prof::enabled()) {
             rknpu_prof::g.n_matmul++; rknpu_prof::g.macs_real += (double)M*K*N;
-            for (int m0 = 0; m0 < M; m0 += m_tile) { int mt = std::min(m_tile, M - m0); int mo = mt > 1 ? rknpu2_calibration::next_power_of_two(mt) : 1; rknpu_prof::g.macs_op += (double)mo*K_op*N; }
+            for (int m0 = 0; m0 < M; m0 += m_tile) { int mt = std::min(m_tile, M - m0); int mo = rknpu_m_bucket(mt); rknpu_prof::g.macs_op += (double)mo*K_op*N; }
         }
         const size_t num_active_segments = active_n_segments.size();
 
@@ -974,7 +982,7 @@ static enum ggml_status rknpu_graph_compute_overlap(ggml_backend_rknpu_context *
 
         for (int m0 = 0; m0 < M; m0 += m_tile) {
             const int Mt = std::min(m_tile, M - m0);
-            const int M_op = Mt > 1 ? rknpu2_calibration::next_power_of_two(Mt) : 1;
+            const int M_op = rknpu_m_bucket(Mt);
             size_t current_offset_in_tensor = 0;
             for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
                 const auto& k_seg = all_k_segments[k_idx];
@@ -2005,7 +2013,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
         if (rknpu_prof::enabled()) {
             rknpu_prof::g.n_matmul++; rknpu_prof::g.macs_real += (double)M*K*N;
-            for (int m0 = 0; m0 < M; m0 += m_tile) { int mt = std::min(m_tile, M - m0); int mo = mt > 1 ? rknpu2_calibration::next_power_of_two(mt) : 1; rknpu_prof::g.macs_op += (double)mo*K_op*N; }
+            for (int m0 = 0; m0 < M; m0 += m_tile) { int mt = std::min(m_tile, M - m0); int mo = rknpu_m_bucket(mt); rknpu_prof::g.macs_op += (double)mo*K_op*N; }
         }
 
         // Initializing variables
@@ -2058,7 +2066,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
         for (int m0 = 0; m0 < M; m0 += m_tile) {
         const int Mt = std::min(m_tile, M - m0);
-        const int M_op = Mt > 1 ? rknpu2_calibration::next_power_of_two(Mt) : 1;
+        const int M_op = rknpu_m_bucket(Mt);
         const float* x = x_all + (size_t)m0 * row_stride;
         float* dst_tile = dst_data + (size_t)m0 * N;
 

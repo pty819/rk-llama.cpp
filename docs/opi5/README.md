@@ -111,7 +111,7 @@ curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' 
 | `RKNPU_FA_MT` | 256 | query tile 行数（也是 key 范围的分桶粒度） |
 | `RKNPU_FA_CHECK` | 0 | 调试：每 k 行算一次 fp32 参考，打印每层 cosine / 最大误差（很慢） |
 | `RKNPU_HOST_COMPUTE` | 1 | 1 = RKNPU 直接读写 CPU buffer（零拷贝）；0 = 旧的 scheduler 拷贝路径（`--no-mmap` 时需要） |
-| `RKNPU_M_TILE` | 256 | 权重 matmul 的 M 方向 tile 行数 |
+| `RKNPU_M_TILE` | 256 | 权重 matmul 的 M 方向切块行数，最大 256。每块向上取到 32、128、256 三档之一，只为这三档创建 context |
 | `RKNPU_NO_A_REUSE` | 未设置 | 设置后禁用 q/k/v、gate/up 之间的 A 量化复用（调试用） |
 | `RKNPU_MAX_N` | 65536 | N 大于它的权重留在 CPU（lm_head / token_embd）；0 = 不限制 |
 | `RKNPU_OVERLAP` | 0 | 1 = 量化/反量化与 NPU 运行重叠（实验性；有 NPU FA 节点的图会自动走串行路径） |
