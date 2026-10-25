@@ -29,6 +29,10 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
     // output rerank head
     cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
 
+    // output embedding projection
+    dense_2_out_layers   = create_tensor(tn(LLM_TENSOR_DENSE_2_OUT, "weight"), {n_embd, hparams.n_embd_out()}, TENSOR_NOT_REQUIRED);
+    dense_2_out_layers_b = create_tensor(tn(LLM_TENSOR_DENSE_2_OUT, "bias"),   {hparams.n_embd_out()        }, TENSOR_NOT_REQUIRED);
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -52,6 +56,16 @@ std::unique_ptr<llm_graph_context> llama_model_qwen3::build_arch_graph(const llm
 }
 
 llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    ggml_tensor * cur = build_backbone(model);
+
+    // lm_head
+    cur = build_lora_mm(model.output, cur, model.output_s);
+
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+}
+
+ggml_tensor * llama_model_qwen3::graph::build_backbone(const llama_model & model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -150,19 +164,5 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // Pooled embeddings never read the logits: skip the [n_embd x n_vocab] lm_head
-    // (151936 x 1024 for Qwen3-0.6B, ~85 GMAC for a 547-token batch).
-    // Set LLAMA_EMBD_KEEP_LM_HEAD=1 to restore the old behaviour.
-    if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE && getenv("LLAMA_EMBD_KEEP_LM_HEAD") == nullptr) {
-        ggml_build_forward_expand(gf, cur);
-        return;
-    }
-
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
-
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
+    return cur;
 }
