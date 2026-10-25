@@ -382,6 +382,7 @@ enum vk_conv_shapes {
     CONV_SHAPE_64x32,
     CONV_SHAPE_32x256,
     CONV_SHAPE_64x128,
+    CONV_SHAPE_256x128,
     CONV_SHAPE_COUNT,
 };
 
@@ -397,6 +398,7 @@ inline vk_conv_block_size vk_conv_block_sizes[CONV_SHAPE_COUNT] = {
     {  64,  32, 32 }, // CONV_SHAPE_64x32
     {  32, 256, 16 }, // CONV_SHAPE_32x256
     {  64, 128, 16 }, // CONV_SHAPE_64x128
+    { 256, 128, 16 }, // CONV_SHAPE_256x128
 };
 
 enum dmmv_wg_sizes {
@@ -1329,12 +1331,14 @@ struct vk_instance_t {
 
     std::vector<size_t> device_indices;
     std::vector<bool>   device_supports_membudget;
+    std::vector<bool>   device_host_buffer_import;
     vk_device devices[GGML_VK_MAX_DEVICES];
 
     std::vector<vk_host_allocation> host_allocations;
     std::shared_mutex               host_allocations_mutex;
 
     size_t host_import_alignment = 0;
+    uint32_t host_import_failed = 0;  // bitmask by device->idx, guarded by host_allocations_mutex
 
     bool multi_device = false;
 };
