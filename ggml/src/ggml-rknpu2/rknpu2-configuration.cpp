@@ -215,7 +215,7 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
 
     // Defining default quantization sequences for each supported ggml_type
     rk3588_config.default_patterns[(int)GGML_TYPE_F16]  = {"W16A16_STANDARD"};
-    rk3588_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A8_STANDARD"};
+    rk3588_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A8_HADAMARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A8_STANDARD", "W4A4_HADAMARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q4_0] = {"W4A4_HADAMARD"};
     // Q4_K_M GGUFs (no official Q4_0 for jina-v5): map like Q4_0
